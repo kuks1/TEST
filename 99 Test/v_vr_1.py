@@ -48,8 +48,8 @@ ACCUM_LIMIT_DECAY_PER_HALF_YEAR = 0.05      # 6개월마다 -0.05
 LUMP_LIMIT                      = 0.50
 WD_LIMIT                        = 0.75
 
-# 적립 금액 (적립식)
-ACCUM_DEPOSIT_PER_CYCLE         = 50.0
+# 적립 금액 (적립식) — Excel 실측치 기준 ($250/2주)
+ACCUM_DEPOSIT_PER_CYCLE         = 250.0
 
 # 단계 라벨
 STAGE_ACCUMULATION              = "accumulation"
