@@ -1,0 +1,30 @@
+# ─── 민감 정보 — 절대 올리지 않음 ─────────────────────────────────────────
+.env
+*.json.key
+*_sa_key.json
+google_sa_key.json
+invest-*.json
+*-credentials.json
+
+# ─── 런타임 상태/로그 ────────────────────────────────────────────────────────
+*_state.json
+*_log.jsonl
+*.jsonl
+
+# ─── Python ─────────────────────────────────────────────────────────────────
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+
+# ─── Node / React ───────────────────────────────────────────────────────────
+frontend/node_modules/
+frontend/.env
+frontend/dist/
+
+# ─── OS ──────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db

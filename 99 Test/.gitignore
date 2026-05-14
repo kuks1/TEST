@@ -1,0 +1,6 @@
+.env
+google_sa_key.json
+token_cache.json
+__pycache__/
+*.pyc
+*.pyo

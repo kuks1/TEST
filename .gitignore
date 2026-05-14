@@ -1,6 +1,20 @@
+# 인증 / 시크릿
 .env
 google_sa_key.json
 token_cache.json
+*_sa_key.json
+
+# 상태 / 로그 (서버 로컬 파일)
+*_state.json
+*.jsonl
+
+# Python
 __pycache__/
 *.pyc
 *.pyo
+.venv/
+venv/
+
+# 기타
+*.tmp
+.DS_Store
