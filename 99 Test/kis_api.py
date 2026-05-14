@@ -410,16 +410,19 @@ def us_balance(exchange: str = "NASD", currency: str = "USD", account: "str | di
         output1 (보유 종목 리스트)
             ovrs_pdno       : 종목코드
             ovrs_item_name  : 종목명
-            cblc_qty        : 잔고 수량
+            ovrs_cblc_qty   : 잔고 수량
+            ord_psbl_qty    : 주문가능 수량
             pchs_avg_pric   : 매입 평균가 (평단가)
             now_pric2       : 현재가
-            evlu_pfls_amt   : 평가손익
-            evlu_erng_rt    : 수익률(%)
+            frcr_evlu_pfls_amt : 평가손익 (달러)
+            evlu_pfls_rt    : 수익률(%)
             tr_crcy_cd      : 통화
+            ovrs_excg_cd    : 거래소 코드
         output2 (계좌 요약)
-            frcr_dncl_amt_1 : 외화 예수금
-            tot_evlu_pfls_amt : 총 평가손익
-            tot_asst_amt    : 총 자산
+            frcr_dncl_amt_1   : 외화 예수금
+            tot_evlu_pfls_amt : 총 평가금액
+            ovrs_tot_pfls     : 해외 총 손익
+            frcr_pchs_amt1    : 외화 매입금액
     """
     acc = _resolve_account(account)
     tr_id = "TTTS3012R" if ENV == "real" else "VTTS3012R"
@@ -444,7 +447,7 @@ def us_avg_price(ticker: str) -> Optional[str]:
     """
     data = us_balance()
     for item in data.get("output1", []):
-        if item.get("ovrs_pdno") == ticker and float(item.get("cblc_qty", 0)) > 0:
+        if item.get("ovrs_pdno") == ticker and float(item.get("ovrs_cblc_qty", 0)) > 0:
             return item.get("pchs_avg_pric")
     return None
 
