@@ -973,15 +973,17 @@ def get_order_row_remaining_qty(row):
 
 
 def get_fill_row_price(row):
-    return to_float(
-        row.get("ft_ccld_unpr3")
-        or row.get("ft_ccld_unpr")
-        or row.get("avg_unpr")
-        or row.get("ft_ord_unpr3")
-        or row.get("ft_ord_unpr")
-        or row.get("ovrs_ord_unpr")
-        or 0
-    )
+    # `or` chain on raw strings treats "0.00000000" as truthy, so unfilled orders
+    # with ft_ccld_unpr3="0.00000000" return 0 instead of falling back to ft_ord_unpr3.
+    # Iterate and convert each field, stopping at the first > 0 result.
+    for key in (
+        "ft_ccld_unpr3", "ft_ccld_unpr", "avg_unpr",
+        "ft_ord_unpr3",  "ft_ord_unpr",  "ovrs_ord_unpr",
+    ):
+        val = to_float(row.get(key))
+        if val > 0:
+            return val
+    return 0.0
 
 
 def get_fill_row_amount(row):
