@@ -579,8 +579,8 @@ def kr_open_orders(account: "str | dict | None" = None) -> dict:
             "ACNT_PRDT_CD": acc["prdt_cd"],
             "CTX_AREA_FK100": "",
             "CTX_AREA_NK100": "",
-            "INQR_DVSN_1": "",
-            "INQR_DVSN_2": "",
+            "INQR_DVSN_1": "0",   # 0=주문 기준
+            "INQR_DVSN_2": "0",   # 0=전체 (1=매도, 2=매수)
         },
     )
 
