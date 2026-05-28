@@ -6,7 +6,6 @@ import 'core/config.dart';
 import 'core/database.dart';
 import 'core/qt_monitor.dart';
 import 'screens/home_screen.dart';
-import 'screens/orders_screen.dart';
 import 'screens/trade_log_screen.dart';
 
 /// 전역 테마 버전 — increment하면 MaterialApp이 새 ThemeData로 재빌드됨
@@ -52,9 +51,9 @@ class AppShell extends StatefulWidget {
 }
 
 class _AppShellState extends State<AppShell> {
-  // 탭 순서: 주문(0) → 홈(1) → 기록(2)
-  int _index = 1; // 기본: 홈
-  var _keys = [UniqueKey(), UniqueKey(), UniqueKey()];
+  // 탭 순서: 홈(0) → 기록(1)
+  int _index = 0;
+  final _keys = [UniqueKey(), UniqueKey()];
 
   void _onTap(int i) {
     setState(() {
@@ -69,19 +68,14 @@ class _AppShellState extends State<AppShell> {
       body: IndexedStack(
         index: _index,
         children: [
-          OrdersScreen(key: _keys[0]),
-          HomeScreen(key: _keys[1]),
-          TradeLogScreen(key: _keys[2]),
+          HomeScreen(key: _keys[0]),
+          TradeLogScreen(key: _keys[1]),
         ],
       ),
       bottomNavigationBar: BottomNavigationBar(
         currentIndex: _index,
         onTap: _onTap,
         items: const [
-          BottomNavigationBarItem(
-              icon: Icon(Icons.receipt_long_outlined),
-              activeIcon: Icon(Icons.receipt_long),
-              label: '주문'),
           BottomNavigationBarItem(
               icon: Icon(Icons.home_outlined),
               activeIcon: Icon(Icons.home),

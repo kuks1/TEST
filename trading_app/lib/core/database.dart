@@ -24,7 +24,7 @@ class AppDatabase {
     return databaseFactory.openDatabase(
       path,
       options: OpenDatabaseOptions(
-        version: 16,
+        version: 22,
         onCreate: _onCreate,
         onUpgrade: _onUpgrade,
       ),
@@ -61,7 +61,11 @@ class AppDatabase {
         v1_salsa_tp_pct REAL DEFAULT NULL,
         v1_salsa_sl_pct REAL DEFAULT NULL,
         cycle_period INTEGER DEFAULT 4,
-        deleted_at TEXT DEFAULT NULL
+        deleted_at TEXT DEFAULT NULL,
+        vr_ref_dow INTEGER DEFAULT NULL,
+        end_capital REAL DEFAULT NULL,
+        server_synced INTEGER DEFAULT 0,
+        sort_order INTEGER DEFAULT 0
       )
     ''');
     await db.execute('''
@@ -103,7 +107,8 @@ class AppDatabase {
         scheduled_at TEXT NOT NULL,
         status TEXT DEFAULT 'pending',
         source_strategy_id TEXT,
-        created_at TEXT
+        created_at TEXT,
+        error_msg TEXT
       )
     ''');
     await db.execute('''
@@ -143,6 +148,36 @@ class AppDatabase {
         side TEXT NOT NULL DEFAULT 'BUY',
         created_at TEXT NOT NULL,
         updated_at TEXT
+      )
+    ''');
+    await db.execute('''
+      CREATE TABLE strategy_order_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        strategy_db_id INTEGER NOT NULL,
+        strategy_id TEXT NOT NULL,
+        date TEXT NOT NULL,
+        side TEXT NOT NULL,
+        day TEXT DEFAULT '',
+        label TEXT DEFAULT '',
+        planned_qty INTEGER DEFAULT 0,
+        planned_price REAL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'Scheduled',
+        created_at TEXT NOT NULL,
+        UNIQUE(strategy_db_id, date, side, day, label)
+      )
+    ''');
+    await db.execute('''
+      CREATE TABLE vr_cycle_records (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        strategy_id TEXT NOT NULL,
+        cycle_no INTEGER NOT NULL,
+        recorded_at TEXT NOT NULL,
+        v_value REAL NOT NULL DEFAULT 0,
+        shares REAL NOT NULL DEFAULT 0,
+        price_per_share REAL NOT NULL DEFAULT 0,
+        pool REAL NOT NULL DEFAULT 0,
+        total_invested REAL NOT NULL DEFAULT 0,
+        notes TEXT
       )
     ''');
   }
@@ -218,6 +253,40 @@ class AppDatabase {
       ''');
     }
     if (oldV < 16) await _upgradeToV16(db);
+    if (oldV < 17) await _upgradeToV17(db);
+    if (oldV < 18) await _upgradeToV18(db);
+    if (oldV < 19) {
+      await db.execute(
+          'ALTER TABLE strategies ADD COLUMN server_synced INTEGER DEFAULT 0');
+    }
+    if (oldV < 21) {
+      try {
+        await db.execute('''
+          CREATE TABLE IF NOT EXISTS vr_cycle_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            strategy_id TEXT NOT NULL,
+            cycle_no INTEGER NOT NULL,
+            recorded_at TEXT NOT NULL,
+            v_value REAL NOT NULL DEFAULT 0,
+            shares REAL NOT NULL DEFAULT 0,
+            price_per_share REAL NOT NULL DEFAULT 0,
+            pool REAL NOT NULL DEFAULT 0,
+            total_invested REAL NOT NULL DEFAULT 0,
+            notes TEXT
+          )
+        ''');
+      } catch (_) {}
+    }
+    if (oldV < 20) {
+      try {
+        await db.execute('ALTER TABLE pending_sells ADD COLUMN error_msg TEXT');
+      } catch (_) {}
+    }
+    if (oldV < 22) {
+      try {
+        await db.execute('ALTER TABLE strategies ADD COLUMN sort_order INTEGER DEFAULT 0');
+      } catch (_) {}
+    }
     if (oldV < 14) {
       await db.execute('''
         CREATE TABLE IF NOT EXISTS qt_sessions (
@@ -258,8 +327,24 @@ class AppDatabase {
   static Future<List<Strategy>> getStrategies() async {
     final d = await db;
     final rows = await d.query('strategies',
-        where: 'deleted_at IS NULL', orderBy: 'created_at DESC');
+        where: 'deleted_at IS NULL',
+        orderBy: 'sort_order ASC, created_at DESC');
     return rows.map(Strategy.fromMap).toList();
+  }
+
+  /// 전략 순서 일괄 저장 — orderedIds 순서대로 sort_order 0,1,2,...
+  static Future<void> updateStrategySortOrders(List<String> orderedIds) async {
+    final d = await db;
+    await d.transaction((txn) async {
+      for (int i = 0; i < orderedIds.length; i++) {
+        await txn.update(
+          'strategies',
+          {'sort_order': i},
+          where: 'strategy_id = ?',
+          whereArgs: [orderedIds[i]],
+        );
+      }
+    });
   }
 
   static Future<List<Strategy>> getDeletedStrategies() async {
@@ -279,24 +364,27 @@ class AppDatabase {
     await d.update('strategies', s.toMap(), where: 'id = ?', whereArgs: [s.id]);
   }
 
-  static Future<void> softDeleteStrategy(int id) async {
+  static Future<void> softDeleteStrategy(int id,
+      {double? endCapital, String? strategyId}) async {
     final d = await db;
-    await d.update(
-      'strategies',
-      {'deleted_at': DateTime.now().toIso8601String()},
-      where: 'id = ?',
-      whereArgs: [id],
-    );
-  }
-
-  static Future<void> restoreStrategy(int id) async {
-    final d = await db;
-    await d.update(
-      'strategies',
-      {'deleted_at': null},
-      where: 'id = ?',
-      whereArgs: [id],
-    );
+    final data = <String, dynamic>{
+      'deleted_at': DateTime.now().toIso8601String(),
+    };
+    if (endCapital != null) data['end_capital'] = endCapital;
+    await d.update('strategies', data, where: 'id = ?', whereArgs: [id]);
+    // Rename logs so future strategies with the same name start clean
+    if (strategyId != null) {
+      final tombstone = '${strategyId}__del__$id';
+      await d.execute(
+          'UPDATE trade_log SET strategy_id = ? WHERE strategy_id = ?',
+          [tombstone, strategyId]);
+      await d.execute(
+          'UPDATE qt_sessions SET strategy_id = ? WHERE strategy_id = ?',
+          [tombstone, strategyId]);
+      await d.execute(
+          'UPDATE qt_order_items SET strategy_id = ? WHERE strategy_id = ?',
+          [tombstone, strategyId]);
+    }
   }
 
   static Future<void> deleteStrategy(int id) async {
@@ -337,15 +425,23 @@ class AppDatabase {
     );
   }
 
-  // ── 매매일지 ───────────────────────────────────────────────
-  static Future<List<Map<String, dynamic>>> getTradeLog(String strategyId) async {
+  static Future<void> markAllServerSynced() async {
     final d = await db;
-    return d.query(
-      'trade_log',
-      where: 'strategy_id = ?',
-      whereArgs: [strategyId],
-      orderBy: 'date DESC',
+    await d.execute(
+      'UPDATE strategies SET server_synced = 1 WHERE deleted_at IS NULL AND server_synced = 0',
     );
+  }
+
+  // ── 매매일지 ───────────────────────────────────────────────
+  static Future<List<Map<String, dynamic>>> getTradeLog(
+      String strategyId, {String? sinceDate, String? untilDate}) async {
+    final d = await db;
+    final wheres = ['strategy_id = ?'];
+    final args = <dynamic>[strategyId];
+    if (sinceDate != null) { wheres.add('date >= ?'); args.add(sinceDate); }
+    if (untilDate != null) { wheres.add('date <= ?'); args.add(untilDate); }
+    return d.query('trade_log',
+        where: wheres.join(' AND '), whereArgs: args, orderBy: 'date DESC');
   }
 
   static Future<void> insertLog(Map<String, dynamic> log) async {
@@ -512,6 +608,107 @@ class AppDatabase {
     try { await db.execute('ALTER TABLE qt_sessions ADD COLUMN pnl_pct REAL DEFAULT NULL'); } catch (_) {}
   }
 
+  static Future<void> _upgradeToV17(Database db) async {
+    try { await db.execute('ALTER TABLE strategies ADD COLUMN vr_ref_dow INTEGER DEFAULT NULL'); } catch (_) {}
+  }
+
+  static Future<void> _upgradeToV18(Database db) async {
+    try { await db.execute('ALTER TABLE strategies ADD COLUMN end_capital REAL DEFAULT NULL'); } catch (_) {}
+    try {
+      await db.execute('''
+        CREATE TABLE IF NOT EXISTS strategy_order_log (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          strategy_db_id INTEGER NOT NULL,
+          strategy_id TEXT NOT NULL,
+          date TEXT NOT NULL,
+          side TEXT NOT NULL,
+          day TEXT DEFAULT '',
+          label TEXT DEFAULT '',
+          planned_qty INTEGER DEFAULT 0,
+          planned_price REAL DEFAULT 0,
+          status TEXT NOT NULL DEFAULT 'Scheduled',
+          created_at TEXT NOT NULL,
+          UNIQUE(strategy_db_id, date, side, day, label)
+        )
+      ''');
+    } catch (_) {}
+  }
+
+  // ── 주문 기록 로그 ──────────────────────────────────────────────
+  static Future<void> upsertOrderLog(Map<String, dynamic> item) async {
+    final d = await db;
+    await d.execute('''
+      INSERT OR REPLACE INTO strategy_order_log
+        (strategy_db_id, strategy_id, date, side, day, label, planned_qty, planned_price, status, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', [
+      item['strategy_db_id'],
+      item['strategy_id'],
+      item['date'],
+      item['side'],
+      item['day'] ?? '',
+      item['label'] ?? '',
+      item['planned_qty'] ?? 0,
+      item['planned_price'] ?? 0.0,
+      item['status'] ?? 'Scheduled',
+      item['created_at'],
+    ]);
+  }
+
+  static Future<List<Map<String, dynamic>>> getOrderLogs(
+      int strategyDbId, {String? date}) async {
+    final d = await db;
+    if (date != null) {
+      final rows = await d.query('strategy_order_log',
+          where: 'strategy_db_id = ? AND date = ?',
+          whereArgs: [strategyDbId, date],
+          orderBy: 'side ASC, id ASC');
+      return rows.map((r) => Map<String, dynamic>.from(r)).toList();
+    }
+    final rows = await d.query('strategy_order_log',
+        where: 'strategy_db_id = ?', whereArgs: [strategyDbId],
+        orderBy: 'date DESC, side ASC, id ASC');
+    return rows.map((r) => Map<String, dynamic>.from(r)).toList();
+  }
+
+  static Future<List<String>> getOrderLogDates(int strategyDbId) async {
+    final d = await db;
+    final rows = await d.rawQuery(
+      'SELECT DISTINCT date FROM strategy_order_log WHERE strategy_db_id = ? ORDER BY date ASC',
+      [strategyDbId],
+    );
+    return rows.map((r) => r['date'] as String).toList();
+  }
+
+  static Future<List<Map<String, dynamic>>> getScheduledOrderLogs(int strategyDbId) async {
+    final d = await db;
+    final rows = await d.query('strategy_order_log',
+        where: "strategy_db_id = ? AND status = 'Scheduled'",
+        whereArgs: [strategyDbId]);
+    return rows.map((r) => Map<String, dynamic>.from(r)).toList();
+  }
+
+  static Future<void> updateOrderLogStatus(int id, String status) async {
+    final d = await db;
+    await d.update('strategy_order_log', {'status': status},
+        where: 'id = ?', whereArgs: [id]);
+  }
+
+  static Future<void> deleteScheduledOrderLogsForDate(
+      int strategyDbId, String date) async {
+    final d = await db;
+    await d.delete('strategy_order_log',
+        where: "strategy_db_id = ? AND date = ? AND status = 'Scheduled'",
+        whereArgs: [strategyDbId, date]);
+  }
+
+  static Future<void> bulkDeleteStrategies(List<int> ids) async {
+    if (ids.isEmpty) return;
+    final d = await db;
+    final placeholders = List.filled(ids.length, '?').join(',');
+    await d.delete('strategies', where: 'id IN ($placeholders)', whereArgs: ids);
+  }
+
   // ── 종목명 캐시 ────────────────────────────────────────────────
   static Future<Map<String, dynamic>?> getLastTradeLogByAction(
       String strategyId, String action) async {
@@ -524,6 +721,30 @@ class AppDatabase {
       limit: 1,
     );
     return rows.isNotEmpty ? Map<String, dynamic>.from(rows.first) : null;
+  }
+
+  // ── VR 사이클 기록 ────────────────────────────────────────────────
+  static Future<int> insertVrCycleRecord(Map<String, dynamic> rec) async {
+    final d = await db;
+    return d.insert('vr_cycle_records', rec);
+  }
+
+  static Future<List<Map<String, dynamic>>> getVrCycleRecords(String strategyId) async {
+    final d = await db;
+    final rows = await d.query('vr_cycle_records',
+        where: 'strategy_id = ?', whereArgs: [strategyId],
+        orderBy: 'cycle_no ASC');
+    return rows.map((r) => Map<String, dynamic>.from(r)).toList();
+  }
+
+  static Future<void> deleteVrCycleRecord(int id) async {
+    final d = await db;
+    await d.delete('vr_cycle_records', where: 'id = ?', whereArgs: [id]);
+  }
+
+  static Future<void> updateVrCycleRecord(int id, Map<String, dynamic> values) async {
+    final d = await db;
+    await d.update('vr_cycle_records', values, where: 'id = ?', whereArgs: [id]);
   }
 
   static Future<void> cacheTickerNames(Map<String, String> names) async {

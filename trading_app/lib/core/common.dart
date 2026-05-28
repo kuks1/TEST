@@ -34,8 +34,8 @@ class MarketClock {
   static String nextKrOpen() {
     if (isKrOpen) return '장 운영중';
     final kst = DateTime.now().toUtc().add(const Duration(hours: 9));
-    final todayOpen = DateTime(kst.year, kst.month, kst.day, 9, 0);
-    if (kst.isBefore(todayOpen) && kst.weekday < 6) return '오늘 09:00 개장';
+    final minutesKst = kst.hour * 60 + kst.minute;
+    if (minutesKst < 540 && kst.weekday < 6) return '오늘 09:00 개장';
     for (int i = 1; i <= 7; i++) {
       final next = kst.add(Duration(days: i));
       if (next.weekday < 6) {
@@ -50,8 +50,8 @@ class MarketClock {
     final offset = _isEdt ? 4 : 5;
     final tz = _isEdt ? 'EDT' : 'EST';
     final et = DateTime.now().toUtc().subtract(Duration(hours: offset));
-    final todayOpen = DateTime(et.year, et.month, et.day, 9, 30);
-    if (et.isBefore(todayOpen) && et.weekday < 6) return '오늘 09:30 개장 ($tz)';
+    final minutesEt = et.hour * 60 + et.minute;
+    if (minutesEt < 570 && et.weekday < 6) return '오늘 09:30 개장 ($tz)';
     for (int i = 1; i <= 7; i++) {
       final next = et.add(Duration(days: i));
       if (next.weekday < 6) {

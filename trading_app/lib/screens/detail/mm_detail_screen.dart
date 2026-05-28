@@ -1,4 +1,3 @@
-import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
@@ -19,7 +18,6 @@ class _V4DetailScreenState extends State<V4DetailScreen> {
   late Strategy _strategy;
   bool _loading = false;
   bool _executing = false;
-  Timer? _pollTimer;
   String? _lastExecTime;
   Map<String, dynamic>? _holding;
   double _cash = 0;
@@ -40,6 +38,8 @@ class _V4DetailScreenState extends State<V4DetailScreen> {
   String _serverMmMode = 'normal';
   int _serverReverseDay = 0;
   bool _serverStateLoaded = false;
+  String _stockName = '';
+  double _quotePrice = 0;
 
   bool get _hasUnsavedChanges =>
       _editingT || _editingConsts || _editingV1Consts ||
@@ -78,7 +78,7 @@ class _V4DetailScreenState extends State<V4DetailScreen> {
     _tCtrl.text = s.tValue?.toStringAsFixed(10) ?? '0';
     _divCtrl.text = (s.divisions ?? (_isV4 ? 20 : 10)).toString();
     _starBaseCtrl.text = (s.starBase ?? 20).toString();
-    _starCoeffCtrl.text = (s.starCoeff ?? 2.0).toStringAsFixed(1);
+    _starCoeffCtrl.text = (s.starCoeff ?? 2.0).toStringAsFixed(2);
     _v1ProfitCtrl.text = (s.v1Value ?? 5.0).toStringAsFixed(1);
     _salsaTpCtrl.text = (s.v1SalsaTpPct ?? 5.0).toStringAsFixed(1);
     _salsaSlCtrl.text = (s.v1SalsaSlPct ?? 10.0).toStringAsFixed(1);
@@ -89,7 +89,6 @@ class _V4DetailScreenState extends State<V4DetailScreen> {
 
   @override
   void dispose() {
-    _pollTimer?.cancel();
     _tCtrl.dispose();
     _divCtrl.dispose();
     _starBaseCtrl.dispose();
@@ -204,7 +203,29 @@ class _V4DetailScreenState extends State<V4DetailScreen> {
       final strategyCash = cashAvailable > 0
           ? cashAvailable
           : (s.capital - costBasis).clamp(0.0, double.infinity);
-      setState(() { _holding = holding; _cash = strategyCash; });
+
+      // 주식명 조회
+      String stockName = '';
+      if (s.symbol.isNotEmpty) {
+        final names = await AppDatabase.getTickerNames();
+        stockName = names[s.symbol.toUpperCase()] ?? names[s.symbol] ?? '';
+      }
+
+      // 현재가: holding에 있으면 사용, 없으면 quote 조회
+      double quotePrice = (holding?['current_price'] as num? ?? 0).toDouble();
+      if (quotePrice <= 0 && s.symbol.isNotEmpty) {
+        try {
+          final q = await ApiService.getQuote(s.symbol.toUpperCase(), s.market);
+          quotePrice = (q['price'] as num? ?? q['current_price'] as num? ?? 0).toDouble();
+        } catch (_) {}
+      }
+
+      setState(() {
+        _holding = holding;
+        _cash = strategyCash;
+        _stockName = stockName;
+        _quotePrice = quotePrice;
+      });
       _checkCycleStatus(shares, shares * avgPrice + strategyCash);
 
       // V4: 서버에서 mm_mode, mm_reverse_day 동기화
@@ -387,28 +408,24 @@ class _V4DetailScreenState extends State<V4DetailScreen> {
     setState(() { _executing = true; _lastExecTime = Fmt.datetime(DateTime.now()); });
     try {
       await ApiService.rebalance(s.strategyId);
-      _startPolling();
-    } catch (e) {
+      if (!mounted) return;
       setState(() { _executing = false; });
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('실행 실패: ${e.toString().replaceFirst('Exception: ', '')}'),
-              backgroundColor: const Color(0xFFF85149)),
-        );
-      }
+      final msg = _isOpen
+          ? '주문 전송 완료'
+          : '저장됨 · ${_nextOpen()} 자동 실행 예정';
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(msg),
+            backgroundColor: const Color(0xFF238636),
+            duration: const Duration(seconds: 4)),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      setState(() { _executing = false; });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('실행 실패: ${e.toString().replaceFirst('Exception: ', '')}'),
+            backgroundColor: const Color(0xFFF85149)),
+      );
     }
-  }
-
-  void _startPolling() {
-    _pollTimer?.cancel();
-    int count = 0;
-    _pollTimer = Timer.periodic(const Duration(minutes: 5), (_) {
-      count++;
-      if (count >= 6) {
-        _pollTimer?.cancel();
-        if (mounted) setState(() { _executing = false; });
-      }
-    });
   }
 
   @override
@@ -442,7 +459,7 @@ class _V4DetailScreenState extends State<V4DetailScreen> {
       if (_isV4) ...[
         _InfoItem('T값', tDisplay),
         _InfoItem('분할 수', '$divisions분할'),
-        _InfoItem('별지점 식', '$starBase - ${starCoeff.toStringAsFixed(1)}T'),
+        _InfoItem('별지점 식', '$starBase - ${starCoeff.toStringAsFixed(2)}T'),
       ],
       if (!_isV4) ...[
         _InfoItem('분할 수', '$divisions분할'),
@@ -484,7 +501,7 @@ class _V4DetailScreenState extends State<V4DetailScreen> {
                   style: const TextStyle(color: Colors.white, fontSize: 12)),
               const Spacer(),
               TextButton(
-                onPressed: () { _pollTimer?.cancel(); setState(() { _executing = false; }); },
+                onPressed: () => setState(() { _executing = false; }),
                 child: const Text('완료', style: TextStyle(color: Colors.white, fontSize: 12)),
               ),
             ]),
@@ -505,6 +522,27 @@ class _V4DetailScreenState extends State<V4DetailScreen> {
                       _StatusDot(active: s.active),
                     ]),
                     const SizedBox(height: 16),
+
+                    // 주식명 + 현재가 헤더
+                    if (s.symbol.isNotEmpty) ...[
+                      Row(crossAxisAlignment: CrossAxisAlignment.baseline, textBaseline: TextBaseline.alphabetic, children: [
+                        Expanded(child: Text(
+                          _stockName.isNotEmpty ? _stockName : s.symbol,
+                          style: const TextStyle(color: Color(0xFFE6EDF3), fontSize: 18, fontWeight: FontWeight.w700),
+                          overflow: TextOverflow.ellipsis,
+                        )),
+                        const SizedBox(width: 8),
+                        Builder(builder: (_) {
+                          final displayPrice = price > 0 ? price : _quotePrice;
+                          if (displayPrice <= 0) return const SizedBox.shrink();
+                          return Text(
+                            moneyFmt(displayPrice),
+                            style: const TextStyle(color: Color(0xFFE6EDF3), fontSize: 16, fontWeight: FontWeight.w600),
+                          );
+                        }),
+                      ]),
+                      const SizedBox(height: 12),
+                    ],
 
                     // 핵심 정보 그리드
                     _InfoGrid(items: gridItems),
@@ -591,7 +629,7 @@ class _V4DetailScreenState extends State<V4DetailScreen> {
                             ])),
                             const SizedBox(width: 12),
                             Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                              const Text('별지점 계수 (0~100, 소수점 1자리)',
+                              const Text('별지점 계수 (0~100, 소수점 2자리)',
                                   style: TextStyle(color: Color(0xFF8B949E), fontSize: 11)),
                               const SizedBox(height: 4),
                               TextField(controller: _starCoeffCtrl,
@@ -884,8 +922,11 @@ class _V4DetailScreenState extends State<V4DetailScreen> {
       final modeLabel = isReverse ? '리버스 모드' : (isRearHalf ? '후반전' : '전반전');
 
       // 포션 = 잔여현금 / (divisions - T) — v4_soxl.py 방식
+      // calcCapital이 설정된 경우 우선 사용 (calcCapital / divisor)
       final divisor = math.max(divisions - tVal, 1.0);
-      final portionAmount = _cash > 0 ? _cash / divisor : divAmount;
+      final portionAmount = s.calcCapital != null
+          ? s.calcCapital! / divisor
+          : (_cash > 0 ? _cash / divisor : divAmount);
       final halfPortion = portionAmount * 0.5;
 
       final usePrice = buyPoint > 0 ? buyPoint : price;
@@ -899,10 +940,10 @@ class _V4DetailScreenState extends State<V4DetailScreen> {
 
       content = Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         // 전략 상태
-        _PRow('T 값', tVal.toStringAsFixed(4)),
+        _PRow('T 값', tVal.toStringAsFixed(10)),
         _PRow('단계', modeLabel,
             color: isReverse ? const Color(0xFFF85149) : isRearHalf ? const Color(0xFFE3B341) : const Color(0xFF58A6FF)),
-        _PRow('별지점 식', '${starBase.toInt()} - ${starCoeff.toStringAsFixed(1)}T = ${(starPct * 100).toStringAsFixed(2)}%'),
+        _PRow('별지점 식', '${starBase.toInt()} - ${starCoeff.toStringAsFixed(2)}T = ${(starPct * 100).toStringAsFixed(2)}%'),
         if (starPriceCost > 0) ...[
           _PRow('별지점 가격', moneyFmt(starPriceCost), color: const Color(0xFF58A6FF)),
           _PRow('매수점 (별지점-0.01)', moneyFmt(buyPoint)),
@@ -913,26 +954,28 @@ class _V4DetailScreenState extends State<V4DetailScreen> {
           const Divider(color: Color(0xFF30363D), height: 16),
           _SectionLabel('🔀 리버스 모드', color: const Color(0xFFF85149)),
           const SizedBox(height: 4),
-          const Text(
-            '5MA 기반 매도·매수 | 종가 ≥ 평단×80% 시 일반모드 복귀',
-            style: TextStyle(color: Color(0xFF8B949E), fontSize: 11),
+          Text(
+            '5MA 기반 매도·매수 | 종가 ≥ 평단×${(100 - starBase).toStringAsFixed(0)}% 시 일반모드 복귀',
+            style: const TextStyle(color: Color(0xFF8B949E), fontSize: 11),
           ),
           const SizedBox(height: 4),
           if (_serverStateLoaded && _serverReverseDay > 0)
             _PRow('현재 리버스 일차', '${_serverReverseDay}일차',
                 color: const Color(0xFFE3B341)),
           if (holdingShares > 0) ...[
+            // 매도 수량 = 보유 / (분할수/2) 내림
             if (!_serverStateLoaded || _serverReverseDay <= 1)
               _PRow('1일차 매도 (MOC 시장가)',
-                  '${math.max((holdingShares * 0.10).floor(), 1)} 주 (보유×10%)'),
+                  '${math.max((holdingShares * 2.0 / divisions).floor(), 1)} 주 (보유÷${divisions ~/ 2})'),
             if (!_serverStateLoaded || _serverReverseDay >= 2) ...[
               _PRow('2일차~ 매도 (LOC @5MA)',
-                  '${math.max((holdingShares * 0.10).floor(), 1)} 주'),
+                  '${math.max((holdingShares * 2.0 / divisions).floor(), 1)} 주'),
               if (_cash > 0)
                 _PRow('2일차~ 매수 (LOC @5MA-0.01)', '잔금 ${moneyFmt(_cash / 4)} 으로 매수'),
             ],
           ],
-          _PRow('복귀 조건', '종가 ≥ ${moneyFmt(avgCost * 0.80)} (평단×80%)'),
+          _PRow('복귀 조건',
+              '종가 ≥ ${moneyFmt(avgCost * (1.0 - starBase / 100.0))} (평단×${(100 - starBase).toStringAsFixed(0)}%)'),
         ],
 
         // ── 일반 모드 매수 계획 ──────────────────
@@ -960,7 +1003,6 @@ class _V4DetailScreenState extends State<V4DetailScreen> {
             _PRow('기준 매수점', moneyFmt(buyPoint)),
             _PRow('최저 가격 (-30%)', moneyFmt(crashRangeMin)),
             _PRow('최대 추가 주문', '20건 (1주씩)'),
-            _PRow('주문 방식', 'LOC (서버 실행 시 자동 계산)'),
           ],
         ],
 
@@ -975,8 +1017,6 @@ class _V4DetailScreenState extends State<V4DetailScreen> {
               '${math.max(holdingShares.toInt() - math.max((holdingShares * 0.25).floor(), 1), 0)} 주 × ${moneyFmt(avgCost * 1.20)}'),
         ],
 
-        const Divider(color: Color(0xFF30363D), height: 16),
-        _PRow('주문 방식', isUs ? 'LOC ord_dvsn=34 (Limit on Close)' : 'LOC 조건부 시장가'),
       ]);
     } else {
       // V1
@@ -1062,7 +1102,6 @@ class _V4DetailScreenState extends State<V4DetailScreen> {
                 style: TextStyle(color: Color(0xFF6E7681), fontSize: 12)),
           const Divider(color: Color(0xFF30363D), height: 16),
           _PRow('익절 목표', '+${profitPct.toStringAsFixed(1)}%'),
-          _PRow('주문 방식', 'LOC (Limit on Close)'),
         ]);
       }
     }

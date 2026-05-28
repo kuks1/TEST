@@ -3,6 +3,7 @@ import '../core/api_service.dart';
 import '../core/app_theme.dart';
 import '../core/common.dart';
 import '../core/database.dart';
+import '../core/qt_monitor.dart';
 import '../models/strategy.dart';
 import 'detail/mm_detail_screen.dart';
 import 'detail/qt_detail_screen.dart';
@@ -27,6 +28,9 @@ class _HomeScreenState extends State<HomeScreen> {
   Set<String> _portfolioTickers = {};
   List<Map<String, dynamic>> _pendingSells = [];
   Map<String, String> _tickerNames = {};
+  Map<String, List<Map<String, dynamic>>> _portfolioStocksMap = {};
+  bool _sellMode = false;
+  final Map<String, String> _sellSelected = {}; // ticker → market
 
   @override
   void initState() {
@@ -34,9 +38,91 @@ class _HomeScreenState extends State<HomeScreen> {
     _load();
   }
 
-  Future<void> _syncToServer() async {
-    if (_syncing) return;
-    setState(() { _syncing = true; });
+  // fullReconcile=false (시작 시): 새 전략만 추가, 기존 건드리지 않음
+  // fullReconcile=true  (sync 버튼): 추가 + 업데이트 + 삭제 reconcile
+  Future<int> _pullFromServer({bool fullReconcile = false}) async {
+    final data = await ApiService.getStrategies();
+    final serverList = (data['strategies'] as List? ?? []);
+
+    final local = await AppDatabase.getStrategies();
+    final deleted = await AppDatabase.getDeletedStrategies();
+    final localById = {for (final s in local) s.strategyId: s};
+    final deletedIds = {for (final s in deleted) s.strategyId};
+    final serverIds = <String>{};
+
+    int changes = 0;
+
+    for (final raw in serverList) {
+      final m = Map<String, dynamic>.from(raw as Map);
+      final sid = m['strategy_id'] as String? ?? '';
+      if (sid.isEmpty || deletedIds.contains(sid)) continue;
+      serverIds.add(sid);
+
+      final stocks = (m['stocks'] as List? ?? []);
+      m['id'] = null;
+      m.remove('deleted_at');
+      m.remove('end_capital');
+      m['server_synced'] = 1;
+
+      final existing = localById[sid];
+      if (existing == null) {
+        // 서버에만 있는 전략 → 로컬에 추가
+        try {
+          final s = Strategy.fromMap(m);
+          await AppDatabase.insertStrategy(s);
+          await _applyStocks(sid, stocks);
+          changes++;
+        } catch (_) {}
+      } else if (fullReconcile) {
+        // 이미 있는 전략 → 서버 데이터로 업데이트
+        try {
+          final s = Strategy.fromMap({...m, 'id': existing.id});
+          await AppDatabase.updateStrategy(s);
+          if (stocks.isNotEmpty) await _applyStocks(sid, stocks);
+          changes++;
+        } catch (_) {}
+      }
+    }
+
+    // fullReconcile: server_synced였는데 서버에 없으면 → 다른 기기에서 삭제된 것
+    if (fullReconcile && serverIds.isNotEmpty) {
+      for (final s in local) {
+        if (s.serverSynced && !serverIds.contains(s.strategyId)) {
+          await AppDatabase.softDeleteStrategy(s.id!, strategyId: s.strategyId);
+          changes++;
+        }
+      }
+    }
+
+    if (changes > 0 && mounted) {
+      final updated = await AppDatabase.getStrategies();
+      final stocksMap = <String, List<Map<String, dynamic>>>{};
+      for (final s in updated) {
+        stocksMap[s.strategyId] = await AppDatabase.getPortfolioStocks(s.strategyId);
+      }
+      setState(() { _strategies = updated; _portfolioStocksMap = stocksMap; });
+    }
+    return changes;
+  }
+
+  Future<void> _applyStocks(String strategyId, List stocks) async {
+    if (stocks.isEmpty) return;
+    await AppDatabase.clearPortfolioStocks(strategyId);
+    for (final st in stocks) {
+      final sm = Map<String, dynamic>.from(st as Map);
+      final ticker = sm['ticker'] as String? ?? '';
+      if (ticker.isEmpty) continue;
+      await AppDatabase.savePortfolioStock(
+        strategyId, ticker,
+        sm['name'] as String? ?? '',
+        (sm['weight'] as num? ?? 0).toDouble(),
+      );
+    }
+  }
+
+  /// 로컬 전략 전체를 서버에 push (pull 없음)
+  /// 이름 변경 등 로컬 변경 즉시 반영 시 사용
+  Future<void> _pushToServer() async {
     try {
       final strategies = await AppDatabase.getStrategies();
       final payload = <Map<String, dynamic>>[];
@@ -45,17 +131,52 @@ class _HomeScreenState extends State<HomeScreen> {
         if (s.type == 'kr_value') {
           final stocks = await AppDatabase.getPortfolioStocks(s.strategyId);
           map['stocks'] = stocks
-              .map((r) => {'ticker': r['ticker'], 'weight': r['weight']})
+              .map((r) => {'ticker': r['ticker'], 'weight': r['weight'], 'name': r['name'] ?? ''})
               .toList();
         }
         payload.add(map);
       }
       await ApiService.syncStrategies(payload);
+      await AppDatabase.markAllServerSynced();
+    } catch (_) {
+      // 서버 미연결 시 무시 — 다음 수동 동기화 때 반영됨
+    }
+  }
+
+  Future<void> _syncToServer() async {
+    if (_syncing) return;
+    setState(() { _syncing = true; });
+    try {
+      // 1. 서버 → 로컬 full reconcile
+      //    - 서버에 있는데 로컬에 없으면 추가
+      //    - 로컬에서 삭제된 전략(server_synced=true)이 서버에 있으면 서버서도 제거 대상
+      final changes = await _pullFromServer(fullReconcile: true);
+
+      // 2. 로컬 활성 전략 전체를 서버에 REPLACE
+      //    (pull 이후 최신 목록 기준 — 삭제된 전략은 자동으로 빠짐)
+      final strategies = await AppDatabase.getStrategies();
+      final payload = <Map<String, dynamic>>[];
+      for (final s in strategies) {
+        final map = s.toMap();
+        if (s.type == 'kr_value') {
+          final stocks = await AppDatabase.getPortfolioStocks(s.strategyId);
+          map['stocks'] = stocks
+              .map((r) => {'ticker': r['ticker'], 'weight': r['weight'], 'name': r['name'] ?? ''})
+              .toList();
+        }
+        payload.add(map);
+      }
+      await ApiService.syncStrategies(payload);
+
+      // 3. 로컬 전략 전부 server_synced=1 표시 (다음 풀에서 삭제 추적 가능)
+      await AppDatabase.markAllServerSynced();
+
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text('${payload.length}개 전략 서버 동기화 완료'),
-          duration: const Duration(seconds: 2),
-        ));
+        final msg = changes > 0
+            ? '동기화 완료 (변경 ${changes}건) — ${payload.length}개 전략'
+            : '동기화 완료 — ${payload.length}개 전략';
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(msg), duration: const Duration(seconds: 2)));
       }
     } catch (e) {
       if (mounted) {
@@ -78,9 +199,11 @@ class _HomeScreenState extends State<HomeScreen> {
       final strategies = results[1] as List<Strategy>;
 
       final tickers = <String>{};
+      final stocksMap = <String, List<Map<String, dynamic>>>{};
       for (final s in strategies) {
         if (s.symbol.isNotEmpty) tickers.add(s.symbol);
         final stocks = await AppDatabase.getPortfolioStocks(s.strategyId);
+        stocksMap[s.strategyId] = stocks;
         for (final st in stocks) {
           final t = st['ticker'] as String? ?? '';
           if (t.isNotEmpty) tickers.add(t);
@@ -90,14 +213,42 @@ class _HomeScreenState extends State<HomeScreen> {
       final pendingSells = await AppDatabase.getPendingSells();
       final tickerNames = await AppDatabase.getTickerNames();
 
+      // pending_sell 중 KIS에서 0주 확인된 항목 즉시 삭제
+      final accountData = results[0] as Map<String, dynamic>;
+      final kisHeld = <String>{};
+      for (final mk in ['kr', 'us']) {
+        for (final acc in (accountData[mk] as List? ?? [])) {
+          for (final h in (acc['holdings'] as List? ?? [])) {
+            final t = (h['ticker'] as String? ?? '').toUpperCase();
+            final shares = (h['shares'] as num? ?? 0).toInt();
+            if (t.isNotEmpty && shares > 0) kisHeld.add(t);
+          }
+        }
+      }
+      for (final ps in pendingSells) {
+        final t = (ps['ticker'] as String? ?? '').toUpperCase();
+        if (t.isNotEmpty && !kisHeld.contains(t)) {
+          await AppDatabase.deletePendingSell(ps['id'] as int);
+        }
+      }
+      final cleanedPendingSells = pendingSells
+          .where((ps) => kisHeld.contains((ps['ticker'] as String? ?? '').toUpperCase()))
+          .toList();
+
       setState(() {
-        _data = results[0] as Map<String, dynamic>;
+        _data = accountData;
         _strategies = strategies;
         _portfolioTickers = tickers;
-        _pendingSells = pendingSells;
+        _portfolioStocksMap = stocksMap;
+        _pendingSells = cleanedPendingSells;
         _tickerNames = tickerNames;
         _lastUpdated = DateTime.now();
       });
+
+      // 서버에서 새 전략 조용히 pull (실패해도 무시)
+      _pullFromServer().catchError((_) => 0);
+      // 앱 시작 시 주문 상태 동기화
+      QTMonitor.checkOnDemand().catchError((_) {});
     } catch (e) {
       setState(() { _error = e.toString(); });
     } finally {
@@ -151,20 +302,44 @@ class _HomeScreenState extends State<HomeScreen> {
     return result;
   }
 
-  double _stratPnl(Strategy s) {
-    if (_data == null || s.symbol.isEmpty) return 0;
-    final key = s.market == 'KR' ? 'kr' : 'us';
-    for (final acc in (_data![key] as List? ?? [])) {
-      for (final h in (acc['holdings'] as List? ?? [])) {
-        if (h['ticker'] == s.symbol) {
-          return Calc.pnlPct(
-            (h['avg_price'] as num? ?? 0).toDouble(),
-            (h['current_price'] as num? ?? 0).toDouble(),
-          );
+  double _vrCapitalBase(Strategy s) {
+    final cycleNo = s.cycleNo ?? 0;
+    return s.capital + cycleNo * (s.vrEffectiveDeposit - s.vrEffectiveWithdrawal);
+  }
+
+  double _stratEval(Strategy s) {
+    if (_data == null) return s.capital;
+    if (s.type == 'kr_value') {
+      final stocks = _portfolioStocksMap[s.strategyId] ?? [];
+      double stockEval = 0, stockCost = 0;
+      for (final st in stocks) {
+        final ticker = st['ticker'] as String? ?? '';
+        final h = _findHolding(ticker, s.market);
+        if (h != null) {
+          final shares = (h['shares'] as num? ?? 0).toDouble();
+          stockEval += shares * (h['current_price'] as num? ?? 0).toDouble();
+          stockCost += shares * (h['avg_price'] as num? ?? 0).toDouble();
         }
       }
+      return (s.capital - stockCost).clamp(0.0, double.infinity) + stockEval;
     }
-    return 0;
+    if (s.symbol.isNotEmpty) {
+      final h = _findHolding(s.symbol, s.market);
+      final base = s.type == 'vr' ? _vrCapitalBase(s) : s.capital;
+      if (h == null) return base;
+      final shares = (h['shares'] as num? ?? 0).toDouble();
+      final cost = shares * (h['avg_price'] as num? ?? 0).toDouble();
+      final val = shares * (h['current_price'] as num? ?? 0).toDouble();
+      return (base - cost).clamp(0.0, double.infinity) + val;
+    }
+    return s.capital;
+  }
+
+  double? _stratPnlPct(Strategy s) {
+    final eval = _stratEval(s);
+    final base = s.type == 'vr' ? _vrCapitalBase(s) : s.capital;
+    if (base <= 0) return null;
+    return (eval / base - 1) * 100;
   }
 
   Map<String, List<Map<String, dynamic>>> _allNoStratHoldingsMap() {
@@ -200,8 +375,21 @@ class _HomeScreenState extends State<HomeScreen> {
     return {'KR': kr, 'US': us};
   }
 
-  double _cashKr() => _krTotal();
-  double _cashUs() => _usTotal();
+  double _cashKr() {
+    final total = _krTotal();
+    final allocated = _strategies
+        .where((s) => s.market == 'KR')
+        .fold(0.0, (a, s) => a + s.capital);
+    return (total - allocated).clamp(0.0, total);
+  }
+
+  double _cashUs() {
+    final total = _usTotal();
+    final allocated = _strategies
+        .where((s) => s.market == 'US')
+        .fold(0.0, (a, s) => a + s.capital);
+    return (total - allocated).clamp(0.0, total);
+  }
 
   void _openDetail(Strategy s) {
     Widget screen;
@@ -269,6 +457,8 @@ class _HomeScreenState extends State<HomeScreen> {
     ctrl.dispose();
     if (newName == null || newName.isEmpty || newName == s.strategyId) return;
     await AppDatabase.renameStrategy(s.id!, s.strategyId, newName);
+    // 이름 변경 즉시 서버에 반영 (pull-first sync 시 구 이름이 재삽입되는 버그 방지)
+    await _pushToServer();
     _load();
   }
 
@@ -335,7 +525,29 @@ class _HomeScreenState extends State<HomeScreen> {
     }
 
     await AppDatabase.clearPortfolioStocks(s.strategyId);
-    await AppDatabase.softDeleteStrategy(s.id!);
+    // Compute end_capital = remaining cash + current holding evaluation
+    double? endCapital;
+    if (s.type == 'kr_value') {
+      double totalEval = 0, totalCost = 0;
+      for (final stock in portfolioStocks) {
+        final h = _findHolding(stock['ticker'] as String, s.market);
+        if (h != null) {
+          final shares = (h['shares'] as num? ?? 0).toDouble();
+          totalEval += shares * (h['current_price'] as num? ?? 0).toDouble();
+          totalCost += shares * (h['avg_price'] as num? ?? 0).toDouble();
+        }
+      }
+      endCapital = (s.capital - totalCost).clamp(0.0, double.infinity) + totalEval;
+    } else if (s.symbol.isNotEmpty) {
+      final h = _findHolding(s.symbol, s.market);
+      if (h != null) {
+        final shares = (h['shares'] as num? ?? 0).toDouble();
+        final costBasis = shares * (h['avg_price'] as num? ?? 0).toDouble();
+        final evalValue = shares * (h['current_price'] as num? ?? 0).toDouble();
+        endCapital = (s.capital - costBasis).clamp(0.0, double.infinity) + evalValue;
+      }
+    }
+    await AppDatabase.softDeleteStrategy(s.id!, endCapital: endCapital, strategyId: s.strategyId);
     _load();
   }
 
@@ -361,15 +573,60 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  Future<void> _executeSells() async {
+    if (_sellSelected.isEmpty) return;
+    final isKrOpen = MarketClock.isKrOpen;
+    final isUsOpen = MarketClock.isUsOpen;
+    final now = DateTime.now();
+    for (final entry in _sellSelected.entries) {
+      final ticker = entry.key;
+      final market = entry.value;
+      final holding = _findHolding(ticker, market);
+      if (holding == null) continue;
+      final shares = (holding['shares'] as num? ?? 0).toDouble();
+      final avgPrice = (holding['avg_price'] as num? ?? 0).toDouble();
+      final name = holding['name'] as String? ?? ticker;
+      final isOpen = market == 'KR' ? isKrOpen : isUsOpen;
+      String? immediateError;
+      if (isOpen) {
+        try {
+          await ApiService.placeOrder(
+            market: market, ticker: ticker, side: 'SELL',
+            quantity: shares.toInt(), price: 0, ordDvsn: '01',
+          );
+        } catch (e) {
+          String msg = e.toString();
+          if (msg.startsWith('Exception: ')) msg = msg.substring(11);
+          immediateError = msg;
+        }
+      }
+      final scheduledAt = isOpen ? now : QTMonitor.nextMarketOpen(market);
+      await AppDatabase.insertPendingSell({
+        'ticker': ticker,
+        'name': name,
+        'market': market,
+        'quantity': shares,
+        'avg_price': avgPrice,
+        'scheduled_at': scheduledAt.toIso8601String(),
+        'status': 'pending',
+        'source_strategy_id': '',
+        'created_at': now.toIso8601String(),
+        if (immediateError != null) 'error_msg': immediateError,
+      });
+    }
+    setState(() { _sellMode = false; _sellSelected.clear(); });
+    _load();
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
         centerTitle: true,
-        title: const Text(
+        title: Text(
           'Gold Mine',
           style: TextStyle(
-            color: Color(0xFFD4AF37),
+            color: AppTheme.accent,
             fontSize: 18,
             fontFamily: 'KBLJump_B',
             letterSpacing: 1.5,
@@ -437,25 +694,40 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget _buildSummary() {
     final krTotal = _krTotal();
     final usTotal = _usTotal();
-    final activeKrCap = _strategies
-        .where((s) => s.active && s.market == 'KR')
+    final allKrCap = _strategies
+        .where((s) => s.market == 'KR')
         .fold(0.0, (a, s) => a + s.capital);
-    final activeUsCap = _strategies
-        .where((s) => s.active && s.market == 'US')
+    final allUsCap = _strategies
+        .where((s) => s.market == 'US')
         .fold(0.0, (a, s) => a + s.capital);
+    final krRemain = (krTotal - allKrCap).clamp(0.0, double.infinity);
+    final usRemain = (usTotal - allUsCap).clamp(0.0, double.infinity);
     return Row(children: [
       Expanded(child: _SumCard(
         label: '한국', market: 'KR', value: Fmt.krw(krTotal),
-        activePct: krTotal > 0 ? (activeKrCap / krTotal).clamp(0.0, 1.0) : 0.0,
-        activeCapStr: Fmt.krw(activeKrCap),
+        activePct: krTotal > 0 ? (allKrCap / krTotal).clamp(0.0, 1.0) : 0.0,
+        allocatedStr: Fmt.krw(allKrCap),
+        remainStr: Fmt.krw(krRemain),
       )),
       const SizedBox(width: 8),
       Expanded(child: _SumCard(
         label: '미국', market: 'US', value: Fmt.usd(usTotal),
-        activePct: usTotal > 0 ? (activeUsCap / usTotal).clamp(0.0, 1.0) : 0.0,
-        activeCapStr: Fmt.usd(activeUsCap),
+        activePct: usTotal > 0 ? (allUsCap / usTotal).clamp(0.0, 1.0) : 0.0,
+        allocatedStr: Fmt.usd(allUsCap),
+        remainStr: Fmt.usd(usRemain),
       )),
     ]);
+  }
+
+  Future<void> _reorderStrategies(int oldIndex, int newIndex) async {
+    // ReorderableListView는 아래로 이동 시 newIndex가 1 크게 옴
+    if (newIndex > oldIndex) newIndex--;
+    setState(() {
+      final s = _strategies.removeAt(oldIndex);
+      _strategies.insert(newIndex, s);
+    });
+    final orderedIds = _strategies.map((s) => s.strategyId).toList();
+    await AppDatabase.updateStrategySortOrders(orderedIds);
   }
 
   Widget _buildStrategies() {
@@ -465,11 +737,7 @@ class _HomeScreenState extends State<HomeScreen> {
         const Spacer(),
         GestureDetector(
           onTap: _openAddSheet,
-          child: Row(children: [
-            Icon(Icons.add, size: 14, color: AppTheme.accent),
-            const SizedBox(width: 2),
-            Text('추가', style: TextStyle(color: AppTheme.accent, fontSize: 12)),
-          ]),
+          child: Icon(Icons.add, size: 18, color: AppTheme.accent),
         ),
       ]),
       const SizedBox(height: 8),
@@ -481,15 +749,30 @@ class _HomeScreenState extends State<HomeScreen> {
               style: TextStyle(color: Color(0xFF6E7681), fontSize: 12)),
         )
       else
-        ..._strategies.map((s) => _StratCard(
-          strategy: s,
-          pnlPct: (s.type != 'kr_value' && s.symbol.isNotEmpty)
-              ? _stratPnl(s) : null,
-          onTap: () => _openDetail(s),
-          onToggle: () => _toggleStrategy(s),
-          onDelete: () => _deleteStrategy(s),
-          onRename: () => _renameStrategy(s),
-        )),
+        ReorderableListView(
+          shrinkWrap: true,
+          physics: const NeverScrollableScrollPhysics(),
+          buildDefaultDragHandles: false,
+          proxyDecorator: (child, index, animation) => Material(
+            color: Colors.transparent,
+            child: child,
+          ),
+          onReorder: _reorderStrategies,
+          children: [
+            for (int i = 0; i < _strategies.length; i++)
+              _StratCard(
+                key: ValueKey(_strategies[i].strategyId),
+                strategy: _strategies[i],
+                dragIndex: i,
+                pnlPct: _strategies[i].active ? _stratPnlPct(_strategies[i]) : null,
+                evalAmount: _strategies[i].active ? _stratEval(_strategies[i]) : null,
+                onTap: () => _openDetail(_strategies[i]),
+                onToggle: () => _toggleStrategy(_strategies[i]),
+                onDelete: () => _deleteStrategy(_strategies[i]),
+                onRename: () => _renameStrategy(_strategies[i]),
+              ),
+          ],
+        ),
     ]);
   }
 
@@ -565,9 +848,19 @@ class _HomeScreenState extends State<HomeScreen> {
               },
             );
           }
+          final ticker = item['ticker'] as String? ?? '';
+          final market = item['market'] as String? ?? 'KR';
           return _NoStratRow(
             holding: item,
-            onAdd: () => _openAddSheet(item['ticker'] as String?),
+            onAdd: _sellMode ? null : () => _openAddSheet(ticker),
+            sellMode: _sellMode,
+            selected: _sellSelected.containsKey(ticker),
+            onSelectionChanged: _sellMode ? (v) {
+              setState(() {
+                if (v == true) { _sellSelected[ticker] = market; }
+                else { _sellSelected.remove(ticker); }
+              });
+            } : null,
           );
         }),
         if (!_noStratExpanded && total > 10)
@@ -590,19 +883,59 @@ class _HomeScreenState extends State<HomeScreen> {
       ]);
     }
 
+    final nonPendingItems = [...krItems, ...usItems].where((i) => i['pending_sell'] == null).toList();
     final totalCount = krItems.length + usItems.length;
     return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
       Row(children: [
         _SecLabel('보유 ($totalCount개)'),
         const Spacer(),
-        if (totalCount > 10)
+        if (_sellMode) ...[
           GestureDetector(
-            onTap: () => setState(() { _noStratExpanded = !_noStratExpanded; }),
+            onTap: () => setState(() {
+              if (_sellSelected.length >= nonPendingItems.length) {
+                _sellSelected.clear();
+              } else {
+                for (final item in nonPendingItems) {
+                  final t = item['ticker'] as String? ?? '';
+                  final m = item['market'] as String? ?? 'KR';
+                  if (t.isNotEmpty) _sellSelected[t] = m;
+                }
+              }
+            }),
             child: Text(
-              _noStratExpanded ? '접기' : '전체 보기',
+              _sellSelected.length >= nonPendingItems.length ? '모두해제' : '모두선택',
               style: TextStyle(color: AppTheme.accent, fontSize: 11),
             ),
           ),
+          const SizedBox(width: 12),
+          GestureDetector(
+            onTap: _executeSells,
+            child: const Text('실행',
+                style: TextStyle(color: Color(0xFF2EA043), fontSize: 11, fontWeight: FontWeight.w600)),
+          ),
+          const SizedBox(width: 12),
+          GestureDetector(
+            onTap: () => setState(() { _sellMode = false; _sellSelected.clear(); }),
+            child: const Text('취소',
+                style: TextStyle(color: Color(0xFFF85149), fontSize: 11)),
+          ),
+        ] else ...[
+          if (totalCount > 10) ...[
+            GestureDetector(
+              onTap: () => setState(() { _noStratExpanded = !_noStratExpanded; }),
+              child: Text(
+                _noStratExpanded ? '접기' : '전체 보기',
+                style: TextStyle(color: AppTheme.accent, fontSize: 11),
+              ),
+            ),
+            const SizedBox(width: 12),
+          ],
+          GestureDetector(
+            onTap: () => setState(() { _sellMode = true; _sellSelected.clear(); }),
+            child: const Text('매도',
+                style: TextStyle(color: Color(0xFFF85149), fontSize: 11, fontWeight: FontWeight.w600)),
+          ),
+        ],
       ]),
       const SizedBox(height: 8),
 
@@ -610,10 +943,10 @@ class _HomeScreenState extends State<HomeScreen> {
       if (krItems.isNotEmpty) ...[
         Row(children: [
           Container(width: 7, height: 7,
-              decoration: BoxDecoration(color: AppTheme.krColor, shape: BoxShape.circle)),
+              decoration: const BoxDecoration(color: Color(0xFF8B949E), shape: BoxShape.circle)),
           const SizedBox(width: 5),
           Text('한국 (${krItems.length})',
-              style: TextStyle(color: AppTheme.krColor, fontSize: 11, fontWeight: FontWeight.w600)),
+              style: const TextStyle(color: Color(0xFF8B949E), fontSize: 11, fontWeight: FontWeight.w600)),
         ]),
         const SizedBox(height: 5),
         _buildItems(krItems),
@@ -624,10 +957,10 @@ class _HomeScreenState extends State<HomeScreen> {
       if (usItems.isNotEmpty) ...[
         Row(children: [
           Container(width: 7, height: 7,
-              decoration: BoxDecoration(color: AppTheme.usColor, shape: BoxShape.circle)),
+              decoration: const BoxDecoration(color: Color(0xFF8B949E), shape: BoxShape.circle)),
           const SizedBox(width: 5),
           Text('미국 (${usItems.length})',
-              style: TextStyle(color: AppTheme.usColor, fontSize: 11, fontWeight: FontWeight.w600)),
+              style: const TextStyle(color: Color(0xFF8B949E), fontSize: 11, fontWeight: FontWeight.w600)),
         ]),
         const SizedBox(height: 5),
         _buildItems(usItems),
@@ -639,17 +972,22 @@ class _HomeScreenState extends State<HomeScreen> {
 
 // ── Summary card ─────────────────────────────────────────────────
 class _SumCard extends StatelessWidget {
-  final String label, market, value, activeCapStr;
+  final String label, market, value;
   final double activePct;
+  final String allocatedStr;  // 전략 할당 합계 (포맷된 금액)
+  final String remainStr;     // 잔여 금액 (포맷된 금액)
   const _SumCard({
     required this.label, required this.market, required this.value,
-    required this.activePct, required this.activeCapStr,
+    required this.activePct,
+    required this.allocatedStr,
+    required this.remainStr,
   });
 
   @override
   Widget build(BuildContext context) {
     final accent = market == 'KR' ? AppTheme.krColor : AppTheme.usColor;
-    final pctStr = '${(activePct * 100).toStringAsFixed(0)}%';
+    final allocPctStr = '${(activePct * 100).toStringAsFixed(0)}%';
+    final remainPctStr = '${((1 - activePct) * 100).toStringAsFixed(0)}%';
     return Container(
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
@@ -680,14 +1018,22 @@ class _SumCard extends StatelessWidget {
             value: activePct,
             minHeight: 5,
             backgroundColor: const Color(0xFF21262D),
-            valueColor: AlwaysStoppedAnimation<Color>(accent),
+            valueColor: AlwaysStoppedAnimation<Color>(AppTheme.accent),
           ),
         ),
         const SizedBox(height: 5),
         Row(children: [
-          Text('전략 운용 $pctStr', style: const TextStyle(color: Color(0xFF6E7681), fontSize: 10)),
-          const Spacer(),
-          Text(activeCapStr, style: const TextStyle(color: Color(0xFF8B949E), fontSize: 10)),
+          Expanded(
+            child: Text('$allocatedStr / $allocPctStr',
+                style: const TextStyle(color: Color(0xFF6E7681), fontSize: 10),
+                overflow: TextOverflow.ellipsis),
+          ),
+          Expanded(
+            child: Text('$remainStr / $remainPctStr',
+                style: const TextStyle(color: Color(0xFF8B949E), fontSize: 10),
+                textAlign: TextAlign.right,
+                overflow: TextOverflow.ellipsis),
+          ),
         ]),
       ]),
     );
@@ -698,17 +1044,21 @@ class _SumCard extends StatelessWidget {
 class _StratCard extends StatelessWidget {
   final Strategy strategy;
   final double? pnlPct;
+  final double? evalAmount;
   final VoidCallback onTap;
   final VoidCallback onToggle;
   final VoidCallback onDelete;
-
   final VoidCallback onRename;
+  final int? dragIndex; // null이면 드래그 핸들 숨김
 
   const _StratCard({
+    super.key,
     required this.strategy, required this.onTap,
     required this.onToggle, required this.onDelete,
     required this.onRename,
     this.pnlPct,
+    this.evalAmount,
+    this.dragIndex,
   });
 
   @override
@@ -716,7 +1066,11 @@ class _StratCard extends StatelessWidget {
     final s = strategy;
     final pnl = pnlPct ?? 0;
     final pnlColor = pnl >= 0 ? const Color(0xFF2EA043) : const Color(0xFFF85149);
-    final capitalStr = s.market == 'KR' ? Fmt.krw(s.capital) : Fmt.usd(s.capital);
+    final isKr = s.market == 'KR';
+    final capitalStr = isKr ? Fmt.krw(s.capital) : Fmt.usd(s.capital);
+    final evalStr = evalAmount != null
+        ? (isKr ? Fmt.krw(evalAmount!) : Fmt.usd(evalAmount!))
+        : null;
 
     return GestureDetector(
       onTap: onTap,
@@ -737,35 +1091,84 @@ class _StratCard extends StatelessWidget {
                 color: const Color(0xFF161B22),
                 padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
                 child: Row(children: [
-                  Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                    Row(children: [
-                      Text(s.strategyId,
-                          style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13)),
-                      const SizedBox(width: 6),
-                      _Chip(s.typeLabel),
-                      const SizedBox(width: 4),
-                      _Chip(s.market),
-                      if (!s.active) ...[
-                        const SizedBox(width: 4),
-                        _Chip('비활성', color: const Color(0xFF21262D),
-                            textColor: const Color(0xFF6E7681)),
-                      ],
-                    ]),
-                    const SizedBox(height: 3),
-                    Text(capitalStr,
+                  // ── 전략명 (최대 10글자 고정폭) ──────────────
+                  SizedBox(
+                    width: 88,
+                    child: Text(
+                      s.strategyId,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13),
+                    ),
+                  ),
+                  const SizedBox(width: 4),
+                  // ── 전략 타입 칩 ──────────────────────────────
+                  _Chip(s.typeLabel),
+                  const SizedBox(width: 3),
+                  // ── 국가 칩 ──────────────────────────────────
+                  _Chip(s.market),
+                  if (!s.active) ...[
+                    const SizedBox(width: 3),
+                    _Chip('비활성', color: const Color(0xFF21262D),
+                        textColor: const Color(0xFF6E7681)),
+                  ],
+                  const Spacer(),
+                  // ── 할당금액 (우측정렬 고정폭) ────────────────
+                  SizedBox(
+                    width: 80,
+                    child: Text(capitalStr,
+                        textAlign: TextAlign.right,
                         style: const TextStyle(color: Color(0xFF8B949E), fontSize: 11)),
-                  ])),
-                  Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
-                    if (s.active && pnlPct != null)
-                      Text(Fmt.pct(pnl),
-                          style: TextStyle(
-                              color: pnlColor, fontWeight: FontWeight.w600, fontSize: 13))
-                    else
-                      const Text('상세 ›',
-                          style: TextStyle(color: Color(0xFF6E7681), fontSize: 11)),
-                    Text('${MarketClock.elapsedDays(s.createdAt)}일',
-                        style: const TextStyle(color: Color(0xFF6E7681), fontSize: 10)),
-                  ]),
+                  ),
+                  const SizedBox(width: 4),
+                  // ── 평가금액 (우측정렬 고정폭) ────────────────
+                  SizedBox(
+                    width: 80,
+                    child: Text(evalStr ?? '-',
+                        textAlign: TextAlign.right,
+                        style: TextStyle(
+                          color: evalStr != null
+                              ? const Color(0xFFE6EDF3)
+                              : const Color(0xFF484F58),
+                          fontSize: 11,
+                        )),
+                  ),
+                  const SizedBox(width: 6),
+                  // ── 수익률 (우측정렬 고정폭) ──────────────────
+                  SizedBox(
+                    width: 58,
+                    child: Text(
+                      s.active && pnlPct != null ? Fmt.pct(pnl) : '-',
+                      textAlign: TextAlign.right,
+                      style: TextStyle(
+                        color: s.active && pnlPct != null
+                            ? pnlColor
+                            : const Color(0xFF484F58),
+                        fontWeight: s.active && pnlPct != null
+                            ? FontWeight.w700
+                            : FontWeight.normal,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  // ── 경과일 (우측정렬 고정폭) ──────────────────
+                  SizedBox(
+                    width: 38,
+                    child: Text(
+                      '${MarketClock.elapsedDays(s.createdAt)}일',
+                      textAlign: TextAlign.right,
+                      style: const TextStyle(color: Color(0xFF6E7681), fontSize: 10),
+                    ),
+                  ),
+                  // ── 드래그 핸들 ───────────────────────────────
+                  if (dragIndex != null) ...[
+                    const SizedBox(width: 6),
+                    ReorderableDragStartListener(
+                      index: dragIndex!,
+                      child: const Icon(Icons.drag_handle,
+                          size: 18, color: Color(0xFF484F58)),
+                    ),
+                  ],
                 ]),
               ),
             ),
@@ -813,8 +1216,17 @@ class _StratCard extends StatelessWidget {
 // ── No-strategy holding row ──────────────────────────────────────
 class _NoStratRow extends StatelessWidget {
   final Map<String, dynamic> holding;
-  final VoidCallback onAdd;
-  const _NoStratRow({required this.holding, required this.onAdd});
+  final VoidCallback? onAdd;
+  final bool sellMode;
+  final bool selected;
+  final ValueChanged<bool?>? onSelectionChanged;
+  const _NoStratRow({
+    required this.holding,
+    this.onAdd,
+    this.sellMode = false,
+    this.selected = false,
+    this.onSelectionChanged,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -831,52 +1243,87 @@ class _NoStratRow extends StatelessWidget {
     final evalStr  = market == 'KR' ? Fmt.krw(evalAmt)  : Fmt.usd(evalAmt);
     final priceStr = market == 'KR' ? Fmt.krw(price)    : Fmt.usd(price);
     final sharesStr = Fmt.shares(shares);
+    final avgStr = market == 'KR' ? Fmt.krw(avg) : Fmt.usd(avg);
 
-    return Container(
+    final container = Container(
       margin: const EdgeInsets.only(bottom: 4),
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
       decoration: BoxDecoration(
-        color: const Color(0xFF161B22),
+        color: sellMode && selected
+            ? const Color(0xFFF85149).withValues(alpha: 0.08)
+            : const Color(0xFF161B22),
         borderRadius: BorderRadius.circular(6),
-        border: Border.all(color: const Color(0xFF21262D)),
+        border: Border.all(
+          color: sellMode && selected
+              ? const Color(0xFFF85149).withValues(alpha: 0.4)
+              : const Color(0xFF21262D),
+        ),
       ),
       child: Row(children: [
-        // 티커 + 종목명
+        if (sellMode) ...[
+          Icon(
+            selected ? Icons.check_box : Icons.check_box_outline_blank,
+            size: 18,
+            color: selected ? const Color(0xFFF85149) : const Color(0xFF6E7681),
+          ),
+          const SizedBox(width: 6),
+        ],
+        // 종목명 + 티커
         SizedBox(
-          width: 64,
+          width: sellMode ? 60 : 72,
           child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text(ticker,
-                style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 12)),
             Text(_Chip._truncate(name, 10),
+                style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 12)),
+            Text(ticker,
                 style: const TextStyle(color: Color(0xFF8B949E), fontSize: 10)),
           ]),
         ),
         const SizedBox(width: 6),
+        // 매입단가
+        Expanded(child: Text(avgStr,
+            style: const TextStyle(color: Color(0xFF8B949E), fontSize: 11),
+            textAlign: TextAlign.right)),
+        const SizedBox(width: 8),
+        // 현재가
+        Expanded(child: Text(priceStr,
+            style: const TextStyle(fontSize: 11),
+            textAlign: TextAlign.right)),
+        const SizedBox(width: 8),
+        // 보유수량
+        Text(sharesStr,
+            style: const TextStyle(color: Color(0xFF8B949E), fontSize: 11)),
+        const SizedBox(width: 8),
         // 평가금
         Expanded(child: Text(evalStr,
             style: const TextStyle(fontSize: 11),
             textAlign: TextAlign.right)),
-        const SizedBox(width: 10),
-        // 보유수량
-        Text(sharesStr,
-            style: const TextStyle(color: Color(0xFF8B949E), fontSize: 11)),
-        const SizedBox(width: 10),
-        // 1주당 현재가
-        Text(priceStr,
-            style: const TextStyle(fontSize: 11)),
-        const SizedBox(width: 10),
+        const SizedBox(width: 8),
         // ±%
         Text(Fmt.pct(pnl),
             style: TextStyle(color: pnlColor, fontSize: 11)),
-        const SizedBox(width: 10),
-        // + 추가
-        GestureDetector(
-          onTap: onAdd,
-          child: Text('+ 추가',
-              style: TextStyle(color: AppTheme.accent, fontSize: 10)),
-        ),
+        if (!sellMode) ...[
+          const SizedBox(width: 8),
+          TextButton(
+            onPressed: onAdd,
+            style: TextButton.styleFrom(
+              foregroundColor: AppTheme.accent,
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              minimumSize: Size.zero,
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            ),
+            child: const Text('+ 추가', style: TextStyle(fontSize: 10)),
+          ),
+        ],
       ]),
     );
+
+    if (sellMode) {
+      return GestureDetector(
+        onTap: () => onSelectionChanged?.call(!selected),
+        child: container,
+      );
+    }
+    return container;
   }
 }
 
@@ -955,6 +1402,7 @@ class _AddSheet extends StatefulWidget {
 
 class _AddSheetState extends State<_AddSheet> {
   int _step = 0;
+  final _scrollCtrl = ScrollController();
 
   // Step 0
   final _idCtrl = TextEditingController();
@@ -968,16 +1416,18 @@ class _AddSheetState extends State<_AddSheet> {
   final _capitalCtrl = TextEditingController();
   String _capCurrency = 'KRW'; // 'KRW' or 'USD' — flip toggle
   bool _usePct = false;        // % 버튼 on/off
-  final _divCtrl = TextEditingController(text: '40');
+  final _divCtrl = TextEditingController(text: '20');
   final _starBaseCtrl = TextEditingController(text: '20');
   final _starCoeffCtrl = TextEditingController(text: '2.0');
   final _v1ProfitCtrl = TextEditingController(text: '5');
+  final _tMmCtrl = TextEditingController();
 
   // Step 1
   final _searchCtrl = TextEditingController();
   final Set<String> _selected = {};
   final Map<String, String> _names = {};
-  String? _market; // 자동 감지
+  String? _market;        // 첫 종목 추가 시 고정
+  bool _searching = false;
 
   // Step 2
   final Map<String, TextEditingController> _wCtrl = {};
@@ -1063,6 +1513,8 @@ class _AddSheetState extends State<_AddSheet> {
     _v1ProfitCtrl.dispose();
     _vrV1Ctrl.dispose();
     _vrCycleCtrl.dispose();
+    _tMmCtrl.dispose();
+    _scrollCtrl.dispose();
     for (final c in _wCtrl.values) { c.dispose(); }
     super.dispose();
   }
@@ -1107,43 +1559,127 @@ class _AddSheetState extends State<_AddSheet> {
   }
 
   Future<void> _addAndValidate(String raw) async {
-    final mkt = _detectMarket(raw);
     if (!_isPortfolio && _selected.isNotEmpty) {
       setState(() { _errMsg = 'MM/VR 전략은 종목 1개만 선택 가능합니다'; });
       return;
     }
-    // Currency → Market constraint (non-PCT mode)
+    setState(() { _searching = true; _errMsg = null; });
+    try {
+      // 시장 결정 우선순위:
+      // 1. _market 고정(보유종목 또는 이전 검색으로 확정)
+      // 2. 통화 설정(KRW→KR, USD→US)
+      // 3. % 모드이고 시장 미확정 → KR/US 동시 조회
+      final searchMarket = _market ?? (!_usePct ? (_capCurrency == 'KRW' ? 'KR' : 'US') : null);
+
+      if (searchMarket != null) {
+        final ticker = searchMarket == 'KR' ? raw.padLeft(6, '0') : raw.toUpperCase();
+        final q = await _tryQuote(raw, searchMarket);
+        if (!mounted) return;
+        if (q == null) {
+          setState(() { _errMsg = '$searchMarket 시장에서 $ticker 종목을 찾을 수 없습니다'; });
+        } else {
+          await _doAdd(ticker, searchMarket, q);
+        }
+      } else {
+        // % 모드 + 시장 미확정 → KR/US 동시 조회
+        final results = await Future.wait([_tryQuote(raw, 'KR'), _tryQuote(raw, 'US')]);
+        if (!mounted) return;
+        final krQ = results[0];
+        final usQ = results[1];
+        if (krQ != null && usQ != null) {
+          final chosen = await _showMarketSelectDialog(raw, krQ, usQ);
+          if (!mounted || chosen == null) return;
+          await _doAdd(chosen.$1, chosen.$2, chosen.$3);
+        } else if (krQ != null) {
+          await _doAdd(raw.padLeft(6, '0'), 'KR', krQ);
+        } else if (usQ != null) {
+          await _doAdd(raw.toUpperCase(), 'US', usQ);
+        } else {
+          setState(() { _errMsg = 'KR/US 어느 시장에서도 종목을 찾을 수 없습니다'; });
+        }
+      }
+    } finally {
+      if (mounted) setState(() { _searching = false; });
+    }
+  }
+
+  Future<Map<String, dynamic>?> _tryQuote(String raw, String market) async {
+    try {
+      final ticker = market == 'KR' ? raw.padLeft(6, '0') : raw.toUpperCase();
+      final q = await ApiService.getQuote(ticker, market);
+      if (q['error'] == true) return null;
+      return q;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> _doAdd(String ticker, String market, Map<String, dynamic> quote) async {
+    if (!mounted) return;
     if (!_usePct) {
       final expectedMkt = _capCurrency == 'KRW' ? 'KR' : 'US';
-      if (mkt != expectedMkt) {
+      if (market != expectedMkt) {
         final curr = _capCurrency == 'KRW' ? '원화(KRW)' : '달러(USD)';
         setState(() { _errMsg = '$curr 할당 시 $expectedMkt 시장 종목만 추가 가능합니다'; });
         return;
       }
     }
-    if (_market != null && _market != mkt) {
+    if (_market != null && _market != market) {
       setState(() { _errMsg = '$_market 시장 종목만 추가할 수 있습니다'; });
       return;
     }
-    final t = mkt == 'KR' ? raw.padLeft(6, '0') : raw.toUpperCase();
-    _names[t] = t;
     setState(() {
-      _selected.add(t);
-      _market ??= mkt;
+      _selected.add(ticker);
+      _market ??= market;
+      _names[ticker] = quote['name'] as String? ?? ticker;
+      _quotes[ticker] = quote;
       _errMsg = null;
       _searchCtrl.clear();
     });
-    try {
-      final q = await ApiService.getQuote(t, mkt);
-      if (!mounted) return;
-      setState(() {
-        if (q.containsKey('name')) _names[t] = q['name'] as String;
-        _quotes[t] = q;
-      });
-    } catch (_) {
-      if (!mounted) return;
-      setState(() { _quotes[t] = {'error': true}; });
-    }
+  }
+
+  Future<(String, String, Map<String, dynamic>)?> _showMarketSelectDialog(
+      String raw, Map<String, dynamic> krQ, Map<String, dynamic> usQ) {
+    final krTicker = raw.padLeft(6, '0');
+    final usTicker = raw.toUpperCase();
+    final krPrice = krQ['current_price'] ?? krQ['price'];
+    final usPrice = usQ['current_price'] ?? usQ['price'];
+    return showDialog<(String, String, Map<String, dynamic>)>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF161B22),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        title: const Text('시장 선택', style: TextStyle(fontSize: 15)),
+        content: Column(mainAxisSize: MainAxisSize.min, children: [
+          Text('$raw 코드가 KR/US 두 시장에 존재합니다.\n추가할 시장을 선택하세요.',
+              style: const TextStyle(color: Color(0xFF8B949E), fontSize: 12)),
+          const SizedBox(height: 16),
+          _MktOption(
+            market: 'KR',
+            ticker: krTicker,
+            name: krQ['name'] as String? ?? krTicker,
+            price: krPrice?.toString() ?? '-',
+            color: AppTheme.krColor,
+            onTap: () => Navigator.pop(ctx, (krTicker, 'KR', krQ)),
+          ),
+          const SizedBox(height: 8),
+          _MktOption(
+            market: 'US',
+            ticker: usTicker,
+            name: usQ['name'] as String? ?? usTicker,
+            price: usPrice?.toString() ?? '-',
+            color: AppTheme.usColor,
+            onTap: () => Navigator.pop(ctx, (usTicker, 'US', usQ)),
+          ),
+        ]),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('취소', style: TextStyle(color: Color(0xFF8B949E))),
+          ),
+        ],
+      ),
+    );
   }
 
   void _equalWeight() {
@@ -1172,11 +1708,13 @@ class _AddSheetState extends State<_AddSheet> {
         capital: _capital,
         createdAt: DateTime.now(),
         v1Value: _actualType == 'v1' ? (double.tryParse(_v1ProfitCtrl.text) ?? 5.0) : null,
-        divisions: (_actualType == 'v1' || _actualType == 'v4') ? (int.tryParse(_divCtrl.text) ?? (_actualType == 'v1' ? 10 : 40)) : null,
+        divisions: (_actualType == 'v1' || _actualType == 'v4') ? (int.tryParse(_divCtrl.text) ?? (_actualType == 'v1' ? 10 : 20)) : null,
         starBase: _actualType == 'v4' ? (int.tryParse(_starBaseCtrl.text) ?? 20) : null,
         starCoeff: _actualType == 'v4' ? (double.tryParse(_starCoeffCtrl.text) ?? 2.0) : null,
         vrMode: _actualType == 'vr' ? _vrMode : null,
-        tValue: isVrResume ? double.tryParse(_vrV1Ctrl.text.trim()) : null,
+        tValue: _actualType == 'v4'
+            ? double.tryParse(_tMmCtrl.text.trim())
+            : (isVrResume ? double.tryParse(_vrV1Ctrl.text.trim()) : null),
         cycleNo: isVrResume ? (int.tryParse(_vrCycleCtrl.text.trim()) ?? 1) : null,
         cyclePeriod: _actualType == 'vr' ? _vrCyclePeriod : null,
       );
@@ -1249,25 +1787,94 @@ class _AddSheetState extends State<_AddSheet> {
           };
         }).toList();
 
-        if (mounted) {
-          await showDialog(
-            context: context,
-            barrierDismissible: false,
-            builder: (_) => _QtOrderDialog(
-              stocks: stocksList,
-              capital: _capital,
-              market: mkt,
-              quotes: quotesMap,
-              strategyId: stratId,
-            ),
-          );
+        final holdingsMap = <String, int>{};
+        for (final h in _allHoldings) {
+          final t = (h['ticker'] as String? ?? '').toUpperCase();
+          final qty = (h['shares'] as num? ?? 0).toInt();
+          if (t.isNotEmpty && qty > 0) holdingsMap[t] = qty;
         }
+        _placeQtOrders(
+          strategyId: stratId,
+          stocks: stocksList,
+          capital: _capital,
+          market: mkt,
+          quotes: quotesMap,
+          existingHoldings: holdingsMap,
+        ).catchError((_) {});
       }
 
       if (mounted) Navigator.pop(context);
       widget.onSaved();
     } catch (e) {
       if (mounted) setState(() { _errMsg = e.toString(); _saving = false; });
+    }
+  }
+
+  Future<void> _placeQtOrders({
+    required String strategyId,
+    required List<Map<String, dynamic>> stocks,
+    required double capital,
+    required String market,
+    required Map<String, Map<String, dynamic>> quotes,
+    Map<String, int> existingHoldings = const {},
+  }) async {
+    final isOpen = market == 'KR' ? MarketClock.isKrOpen : MarketClock.isUsOpen;
+    final now = DateTime.now().toIso8601String();
+    final sessionId = await AppDatabase.insertQtSession({
+      'strategy_id': strategyId,
+      'session_type': 'create',
+      'total_capital': capital,
+      'market': market,
+      'status': 'active',
+      'created_at': now,
+    });
+    if (!isOpen) {
+      try { await ApiService.rebalance(strategyId); } catch (_) {}
+      for (final stock in stocks) {
+        final ticker = stock['ticker'] as String;
+        final weight = (stock['weight'] as num? ?? 0).toDouble();
+        final q = quotes[ticker];
+        final price = (q?['price'] as num? ?? q?['current_price'] as num? ?? 0).toDouble();
+        final alloc = capital * weight / 100;
+        final targetQty = price > 0 ? (alloc / price).floor() : 0;
+        final deltaQty = (targetQty - (existingHoldings[ticker.toUpperCase()] ?? 0))
+            .clamp(0, targetQty);
+        if (deltaQty <= 0) continue;
+        await AppDatabase.insertQtOrderItem({
+          'session_id': sessionId, 'strategy_id': strategyId,
+          'ticker': ticker, 'name': stock['name'] as String? ?? ticker,
+          'weight': weight, 'allocation_amount': alloc,
+          'planned_qty': deltaQty, 'planned_price': price,
+          'actual_qty': 0, 'actual_price': 0.0,
+          'status': 'Scheduled', 'side': 'BUY', 'created_at': now,
+        });
+      }
+    } else {
+      for (final stock in stocks) {
+        final ticker = stock['ticker'] as String;
+        final weight = (stock['weight'] as num? ?? 0).toDouble();
+        final q = quotes[ticker];
+        final price = (q?['price'] as num? ?? q?['current_price'] as num? ?? 0).toDouble();
+        final alloc = capital * weight / 100;
+        final targetQty = price > 0 ? (alloc / price).floor() : 0;
+        final deltaQty = (targetQty - (existingHoldings[ticker.toUpperCase()] ?? 0))
+            .clamp(0, targetQty);
+        if (deltaQty <= 0 || price <= 0) continue;
+        await AppDatabase.insertQtOrderItem({
+          'session_id': sessionId, 'strategy_id': strategyId,
+          'ticker': ticker, 'name': stock['name'] as String? ?? ticker,
+          'weight': weight, 'allocation_amount': alloc,
+          'planned_qty': deltaQty, 'planned_price': price,
+          'actual_qty': 0, 'actual_price': 0.0,
+          'status': 'Scheduled', 'side': 'BUY', 'created_at': now,
+        });
+        try {
+          await ApiService.placeOrder(
+            market: market, ticker: ticker, side: 'BUY',
+            quantity: deltaQty, price: 0, ordDvsn: '01',
+          );
+        } catch (_) {}
+      }
     }
   }
 
@@ -1287,23 +1894,28 @@ class _AddSheetState extends State<_AddSheet> {
               if (_step > 0)
                 GestureDetector(
                   onTap: () => setState(() { _step--; _errMsg = null; }),
-                  child: const Icon(Icons.arrow_back_ios, size: 16,
-                      color: Color(0xFF8B949E)),
+                  child: Icon(Icons.arrow_back_ios, size: 16,
+                      color: AppTheme.accent),
                 )
               else
                 const SizedBox(width: 16),
               const Spacer(),
-              Text('전략 추가 (${_step + 1}/2)',
-                  style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 14)),
+              Row(mainAxisSize: MainAxisSize.min, children: [
+                const Text('전략 추가 ', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 14)),
+                Text('(${_step + 1}/2)', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 14, color: AppTheme.accent)),
+              ]),
               const Spacer(),
               const SizedBox(width: 16),
             ]),
           ),
           const Divider(color: Color(0xFF30363D), height: 1),
-          Expanded(child: SingleChildScrollView(
-            padding: const EdgeInsets.all(16),
-            child: _stepContent(),
-          )),
+          Expanded(child: _step == 0
+            ? SingleChildScrollView(
+                controller: _scrollCtrl,
+                padding: const EdgeInsets.all(16),
+                child: _step0(),
+              )
+            : _step1()),
           if (_errMsg != null)
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
@@ -1335,13 +1947,6 @@ class _AddSheetState extends State<_AddSheet> {
         ]),
       ),
     );
-  }
-
-  Widget _stepContent() {
-    switch (_step) {
-      case 0: return _step0();
-      default: return _step1();
-    }
   }
 
   // ── Step 0: 전략 기본 설정 ──────────────────────────────────
@@ -1377,7 +1982,7 @@ class _AddSheetState extends State<_AddSheet> {
               selected: _mmType == 'v1',
               onTap: () => setState(() {
                 _mmType = 'v1';
-                if (_divCtrl.text == '40') _divCtrl.text = '10';
+                if (_divCtrl.text == '20') _divCtrl.text = '10';
               }),
             ),
             const SizedBox(width: 8),
@@ -1386,7 +1991,7 @@ class _AddSheetState extends State<_AddSheet> {
               selected: _mmType == 'v4',
               onTap: () => setState(() {
                 _mmType = 'v4';
-                if (_divCtrl.text == '10') _divCtrl.text = '40';
+                if (_divCtrl.text == '10') _divCtrl.text = '20';
               }),
             ),
           ]),
@@ -1403,7 +2008,7 @@ class _AddSheetState extends State<_AddSheet> {
               if (mode != '적립식') const SizedBox(width: 8),
               _MmTypeChip(
                 label: mode,
-                subtitle: mode == '적립식' ? '매주 적립' : mode == '거치식' ? '거치 운용' : '매주 인출',
+                subtitle: null,
                 selected: _vrMode == mode,
                 onTap: () => setState(() { _vrMode = mode; }),
               ),
@@ -1420,10 +2025,10 @@ class _AddSheetState extends State<_AddSheet> {
               child: Container(
                 padding: const EdgeInsets.symmetric(vertical: 10),
                 decoration: BoxDecoration(
-                  color: _vrCyclePeriod == p ? const Color(0xFF1F6FEB) : const Color(0xFF21262D),
+                  color: _vrCyclePeriod == p ? AppTheme.accent : const Color(0xFF21262D),
                   borderRadius: BorderRadius.circular(6),
                   border: Border.all(
-                    color: _vrCyclePeriod == p ? const Color(0xFF1F6FEB) : const Color(0xFF30363D),
+                    color: _vrCyclePeriod == p ? AppTheme.accent : const Color(0xFF30363D),
                   ),
                 ),
                 child: Center(child: Text('$p주',
@@ -1443,7 +2048,7 @@ class _AddSheetState extends State<_AddSheet> {
             Icon(
               _vrResume ? Icons.check_box : Icons.check_box_outline_blank,
               size: 18,
-              color: _vrResume ? const Color(0xFF58A6FF) : const Color(0xFF8B949E),
+              color: _vrResume ? AppTheme.accent : const Color(0xFF8B949E),
             ),
             const SizedBox(width: 6),
             const Text('기존 진행 중인 VR 전략 이어받기',
@@ -1533,10 +2138,10 @@ class _AddSheetState extends State<_AddSheet> {
           child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
             Text(
               _usePct
-                  ? '총 평가금액  KR: ${Fmt.krw(widget.cashKr)}  /  US: ${Fmt.usd(widget.cashUs)}'
+                  ? '배분 가능 잔액  KR: ${Fmt.krw(widget.cashKr)}  /  US: ${Fmt.usd(widget.cashUs)}'
                   : _capCurrency == 'KRW'
-                      ? '총 평가금액: ${Fmt.krw(widget.cashKr)}'
-                      : '총 평가금액: ${Fmt.usd(widget.cashUs)}',
+                      ? '배분 가능 잔액: ${Fmt.krw(widget.cashKr)}'
+                      : '배분 가능 잔액: ${Fmt.usd(widget.cashUs)}',
               style: const TextStyle(fontSize: 11, color: Color(0xFF8B949E)),
             ),
             if (_capital > _availableInCapUnit && _availableInCapUnit > 0 && _capital > 0)
@@ -1558,11 +2163,11 @@ class _AddSheetState extends State<_AddSheet> {
         _Lbl('전략 설정'),
         Row(children: [
           Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text(_mmType == 'v1' ? '분할 수 (기본 10)' : '분할 수 (기본 40)',
+            Text(_mmType == 'v1' ? '분할 수 (기본 10)' : '분할 수 (기본 20)',
                 style: const TextStyle(color: Color(0xFF8B949E), fontSize: 10)),
             const SizedBox(height: 4),
             _Inp(controller: _divCtrl,
-                hint: _mmType == 'v1' ? '10' : '40',
+                hint: _mmType == 'v1' ? '10' : '20',
                 keyboardType: TextInputType.number,
                 onChanged: (_) => setState(() {})),
           ])),
@@ -1604,14 +2209,24 @@ class _AddSheetState extends State<_AddSheet> {
               style: const TextStyle(color: Color(0xFF58A6FF), fontSize: 11),
             ),
           ),
-        if (_mmType == 'v4')
+        if (_mmType == 'v4') ...[
+          const SizedBox(height: 10),
+          Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const Text('현재 T 값 (이어받기 시)',
+                style: TextStyle(color: Color(0xFF8B949E), fontSize: 10)),
+            const SizedBox(height: 4),
+            _Inp(controller: _tMmCtrl, hint: '미입력 시 0',
+                keyboardType: TextInputType.number,
+                onChanged: (_) => setState(() {})),
+          ]),
           Padding(
             padding: const EdgeInsets.only(top: 6),
             child: Text(
-              '별지점 식: ${_starBaseCtrl.text.isEmpty ? '20' : _starBaseCtrl.text} - ${_starCoeffCtrl.text.isEmpty ? '2.0' : _starCoeffCtrl.text}T  ·  ${_divCtrl.text.isEmpty ? '40' : _divCtrl.text}분할',
+              '별지점 식: ${_starBaseCtrl.text.isEmpty ? '20' : _starBaseCtrl.text} - ${_starCoeffCtrl.text.isEmpty ? '2.0' : _starCoeffCtrl.text}T  ·  ${_divCtrl.text.isEmpty ? '20' : _divCtrl.text}분할',
               style: const TextStyle(color: Color(0xFF58A6FF), fontSize: 11),
             ),
           ),
+        ],
       ],
     ]);
   }
@@ -1620,125 +2235,52 @@ class _AddSheetState extends State<_AddSheet> {
   Widget _step1() {
     final holdings = _allHoldings;
     return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-      // 감지된 시장 표시
-      if (_market != null)
-        Padding(
-          padding: const EdgeInsets.only(bottom: 10),
-          child: Row(children: [
-            Container(width: 8, height: 8,
-              decoration: BoxDecoration(
+      // ── 상단 섹션: 입력 + 선택 칩 + 비중 미리보기 (최대 화면 45%, 초과 시 자체 스크롤) ──
+      ConstrainedBox(
+        constraints: BoxConstraints(maxHeight: MediaQuery.of(context).size.height * 0.45),
+        child: SingleChildScrollView(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      // 시장 표시 (자동감지 / 고정)
+      if (_market != null) Padding(
+        padding: const EdgeInsets.only(bottom: 10),
+        child: Row(children: [
+          Container(width: 8, height: 8,
+            decoration: BoxDecoration(
+              color: _market == 'KR' ? AppTheme.krColor : AppTheme.usColor,
+              shape: BoxShape.circle,
+            )),
+          const SizedBox(width: 6),
+          Text('$_market 시장 고정',
+              style: TextStyle(fontSize: 11,
                 color: _market == 'KR' ? AppTheme.krColor : AppTheme.usColor,
-                shape: BoxShape.circle,
               )),
-            const SizedBox(width: 6),
-            Text('$_market 시장 감지됨',
-                style: TextStyle(fontSize: 11,
-                  color: _market == 'KR' ? AppTheme.krColor : AppTheme.usColor,
-                )),
-          ]),
-        ),
+        ]),
+      ),
 
-      _Lbl('보유 종목 (전략없음)'),
-      const SizedBox(height: 4),
-      if (holdings.isEmpty)
-        const Padding(
-          padding: EdgeInsets.symmetric(vertical: 8),
-          child: Text('전략없음 종목이 없습니다.',
-              style: TextStyle(color: Color(0xFF6E7681), fontSize: 12)),
-        )
-      else
-        ...holdings.map((h) {
-          final ticker = h['ticker'] as String? ?? '';
-          final name = h['name'] as String? ?? ticker;
-          final price = (h['current_price'] as num? ?? 0).toDouble();
-          final mkt = h['market'] as String? ?? 'KR';
-          final priceStr = mkt == 'KR' ? Fmt.krw(price) : Fmt.usd(price);
-          // Disable if currency (in non-PCT mode) doesn't match market
-          final currencyLocked = !_usePct &&
-              ((_capCurrency == 'KRW' && mkt != 'KR') ||
-               (_capCurrency == 'USD' && mkt != 'US'));
-          final disabled = currencyLocked || (_market != null && _market != mkt);
-
-          final alreadyFull = !_isPortfolio && _selected.isNotEmpty && !_selected.contains(ticker);
-          return CheckboxListTile(
-            value: _selected.contains(ticker),
-            onChanged: (disabled || alreadyFull) ? null : (v) {
-              if (v == true) {
-                setState(() {
-                  _selected.add(ticker);
-                  _market ??= mkt;
-                  // Auto-switch currency to match the selected holding's market
-                  if (!_usePct) {
-                    _capCurrency = mkt == 'KR' ? 'KRW' : 'USD';
-                  }
-                  // Pre-validate from holding data (known valid)
-                  _quotes[ticker] = {
-                    'current_price': h['current_price'],
-                    'price': h['current_price'],
-                    'name': h['name'] ?? ticker,
-                  };
-                  _names[ticker] = h['name'] as String? ?? ticker;
-                });
-              } else {
-                setState(() {
-                  _selected.remove(ticker);
-                  _quotes.remove(ticker);
-                  if (_selected.isEmpty) _market = null;
-                });
-              }
-            },
-            title: Row(children: [
-              Text(ticker,
-                  style: TextStyle(
-                    fontWeight: FontWeight.w600, fontSize: 12,
-                    color: (disabled || alreadyFull) ? const Color(0xFF6E7681) : null,
-                  )),
-              const SizedBox(width: 4),
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
-                decoration: BoxDecoration(
-                  color: mkt == 'KR'
-                      ? AppTheme.krColor.withValues(alpha: 0.15)
-                      : AppTheme.usColor.withValues(alpha: 0.15),
-                  borderRadius: BorderRadius.circular(3),
-                ),
-                child: Text(mkt, style: TextStyle(
-                  fontSize: 8,
-                  color: mkt == 'KR' ? AppTheme.krColor : AppTheme.usColor,
-                )),
-              ),
-              const SizedBox(width: 4),
-              Expanded(child: Text(name,
-                  style: TextStyle(
-                    color: disabled ? const Color(0xFF6E7681) : const Color(0xFF8B949E),
-                    fontSize: 11,
-                  ),
-                  overflow: TextOverflow.ellipsis)),
-            ]),
-            subtitle: Text(priceStr,
-                style: const TextStyle(color: Color(0xFF6E7681), fontSize: 10)),
-            activeColor: AppTheme.accent,
-            dense: true,
-            contentPadding: EdgeInsets.zero,
-          );
-        }),
-
-      const Divider(color: Color(0xFF30363D), height: 20),
-      _Lbl('직접 입력'),
+      _Lbl('종목 코드'),
       Row(children: [
         Expanded(child: _Inp(
           controller: _searchCtrl,
-          hint: '숫자 6자리=KR, 영문=US',
+          hint: _market == 'KR'
+              ? 'KR 종목코드 (예: 005930, 0193T0)'
+              : _market == 'US'
+                  ? 'US ticker (예: AAPL, TSLA)'
+                  : '종목 코드 입력 (KR/US 자동감지)',
           onChanged: (_) => setState(() {}),
         )),
         const SizedBox(width: 8),
         ElevatedButton(
-          onPressed: _searchCtrl.text.trim().isEmpty ? null : () {
+          onPressed: (_searchCtrl.text.trim().isEmpty || _searching) ? null : () {
             _addAndValidate(_searchCtrl.text.trim());
           },
           style: ElevatedButton.styleFrom(
               padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10)),
-          child: const Text('추가'),
+          child: _searching
+              ? const SizedBox(width: 16, height: 16,
+                  child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+              : const Text('추가'),
         ),
       ]),
       if (_selected.isNotEmpty) ...[
@@ -1942,6 +2484,105 @@ class _AddSheetState extends State<_AddSheet> {
           ),
         ],
       ],
+
+        ]), // inner Column
+          ), // Padding
+        ), // SingleChildScrollView
+      ), // ConstrainedBox
+      // ── 보유 종목 헤더 ────────────────────────────────────────
+      const Padding(
+        padding: EdgeInsets.symmetric(horizontal: 16),
+        child: Divider(color: Color(0xFF30363D), height: 20),
+      ),
+      Padding(
+        padding: const EdgeInsets.fromLTRB(16, 0, 16, 4),
+        child: _Lbl('보유 종목 (전략없음)'),
+      ),
+      // ── 독립 스크롤 홀딩스 목록 (상단 섹션 변화에 무영향) ────────
+      Expanded(
+        child: holdings.isEmpty
+            ? const Padding(
+                padding: EdgeInsets.fromLTRB(16, 4, 16, 0),
+                child: Text('전략없음 종목이 없습니다.',
+                    style: TextStyle(color: Color(0xFF6E7681), fontSize: 12)),
+              )
+            : ListView.builder(
+                padding: const EdgeInsets.symmetric(horizontal: 16),
+                itemCount: holdings.length,
+                itemBuilder: (_, i) {
+                  final h = holdings[i];
+                  final ticker = h['ticker'] as String? ?? '';
+                  final name = h['name'] as String? ?? ticker;
+                  final price = (h['current_price'] as num? ?? 0).toDouble();
+                  final mkt = h['market'] as String? ?? 'KR';
+                  final priceStr = mkt == 'KR' ? Fmt.krw(price) : Fmt.usd(price);
+                  final currencyLocked = !_usePct &&
+                      ((_capCurrency == 'KRW' && mkt != 'KR') ||
+                       (_capCurrency == 'USD' && mkt != 'US'));
+                  final disabled = currencyLocked || (_market != null && _market != mkt);
+                  final alreadyFull = !_isPortfolio && _selected.isNotEmpty && !_selected.contains(ticker);
+                  return CheckboxListTile(
+                    value: _selected.contains(ticker),
+                    onChanged: (disabled || alreadyFull) ? null : (v) {
+                      if (v == true) {
+                        setState(() {
+                          _selected.add(ticker);
+                          _market ??= mkt;
+                          if (!_usePct) {
+                            _capCurrency = mkt == 'KR' ? 'KRW' : 'USD';
+                          }
+                          _quotes[ticker] = {
+                            'current_price': h['current_price'],
+                            'price': h['current_price'],
+                            'name': h['name'] ?? ticker,
+                          };
+                          _names[ticker] = h['name'] as String? ?? ticker;
+                        });
+                      } else {
+                        setState(() {
+                          _selected.remove(ticker);
+                          _quotes.remove(ticker);
+                          if (_selected.isEmpty) _market = null;
+                        });
+                      }
+                    },
+                    title: Row(children: [
+                      Text(ticker,
+                          style: TextStyle(
+                            fontWeight: FontWeight.w600, fontSize: 12,
+                            color: (disabled || alreadyFull) ? const Color(0xFF6E7681) : null,
+                          )),
+                      const SizedBox(width: 4),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                        decoration: BoxDecoration(
+                          color: mkt == 'KR'
+                              ? AppTheme.krColor.withValues(alpha: 0.15)
+                              : AppTheme.usColor.withValues(alpha: 0.15),
+                          borderRadius: BorderRadius.circular(3),
+                        ),
+                        child: Text(mkt, style: TextStyle(
+                          fontSize: 8,
+                          color: mkt == 'KR' ? AppTheme.krColor : AppTheme.usColor,
+                        )),
+                      ),
+                      const SizedBox(width: 4),
+                      Expanded(child: Text(name,
+                          style: TextStyle(
+                            color: disabled ? const Color(0xFF6E7681) : const Color(0xFF8B949E),
+                            fontSize: 11,
+                          ),
+                          overflow: TextOverflow.ellipsis)),
+                    ]),
+                    subtitle: Text(priceStr,
+                        style: const TextStyle(color: Color(0xFF6E7681), fontSize: 10)),
+                    activeColor: AppTheme.accent,
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                  );
+                },
+              ),
+      ),
     ]);
   }
 
@@ -1976,11 +2617,11 @@ class _CurrencySeg extends StatelessWidget {
 // ── MM 세부 전략 선택 칩 ─────────────────────────────────────────
 class _MmTypeChip extends StatelessWidget {
   final String label;
-  final String subtitle;
+  final String? subtitle;
   final bool selected;
   final VoidCallback onTap;
   const _MmTypeChip({
-    required this.label, required this.subtitle,
+    required this.label, this.subtitle,
     required this.selected, required this.onTap,
   });
 
@@ -1990,10 +2631,10 @@ class _MmTypeChip extends StatelessWidget {
         child: Container(
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
           decoration: BoxDecoration(
-            color: selected ? const Color(0xFF1F6FEB) : const Color(0xFF21262D),
+            color: selected ? AppTheme.accent : const Color(0xFF21262D),
             borderRadius: BorderRadius.circular(8),
             border: Border.all(
-              color: selected ? const Color(0xFF1F6FEB) : const Color(0xFF30363D),
+              color: selected ? AppTheme.accent : const Color(0xFF30363D),
             ),
           ),
           child: Column(mainAxisSize: MainAxisSize.min, children: [
@@ -2001,11 +2642,13 @@ class _MmTypeChip extends StatelessWidget {
               fontSize: 13, fontWeight: FontWeight.w700,
               color: selected ? Colors.white : const Color(0xFFE6EDF3),
             )),
-            const SizedBox(height: 2),
-            Text(subtitle, style: TextStyle(
-              fontSize: 10,
-              color: selected ? Colors.white70 : const Color(0xFF8B949E),
-            )),
+            if (subtitle != null) ...[
+              const SizedBox(height: 2),
+              Text(subtitle!, style: TextStyle(
+                fontSize: 10,
+                color: selected ? Colors.white70 : const Color(0xFF8B949E),
+              )),
+            ],
           ]),
         ),
       );
@@ -2344,6 +2987,7 @@ class _PendingSellRow extends StatelessWidget {
     final price = (holding['current_price'] as num? ?? 0).toDouble();
     final market = holding['market'] as String? ?? 'KR';
     final scheduledAt = pendingSell['scheduled_at'] as String? ?? '';
+    final errorMsg = pendingSell['error_msg'] as String?;
 
     final value = qty * price;
     final valStr = price > 0
@@ -2356,7 +3000,11 @@ class _PendingSellRow extends StatelessWidget {
       decoration: BoxDecoration(
         color: const Color(0xFF161B22),
         borderRadius: BorderRadius.circular(6),
-        border: Border.all(color: const Color(0xFFF85149).withValues(alpha: 0.35)),
+        border: Border.all(
+          color: errorMsg != null
+              ? const Color(0xFFD29922).withValues(alpha: 0.5)
+              : const Color(0xFFF85149).withValues(alpha: 0.35),
+        ),
       ),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         Row(children: [
@@ -2398,7 +3046,63 @@ class _PendingSellRow extends StatelessWidget {
                 style: TextStyle(color: Color(0xFFF85149), fontSize: 10)),
           ),
         ]),
+        if (errorMsg != null && errorMsg.isNotEmpty) ...[
+          const SizedBox(height: 5),
+          Row(children: [
+            const Icon(Icons.warning_amber_rounded,
+                size: 11, color: Color(0xFFD29922)),
+            const SizedBox(width: 4),
+            Expanded(child: Text(
+              errorMsg,
+              style: const TextStyle(color: Color(0xFFD29922), fontSize: 10),
+            )),
+          ]),
+        ],
       ]),
+    );
+  }
+}
+
+// ── 시장 선택 다이얼로그 옵션 카드 ─────────────────────────────────
+class _MktOption extends StatelessWidget {
+  final String market;
+  final String ticker;
+  final String name;
+  final String price;
+  final Color color;
+  final VoidCallback onTap;
+  const _MktOption({
+    required this.market,
+    required this.ticker,
+    required this.name,
+    required this.price,
+    required this.color,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+        decoration: BoxDecoration(
+          color: color.withValues(alpha: 0.08),
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: color.withValues(alpha: 0.4), width: 1),
+        ),
+        child: Row(children: [
+          Container(width: 6, height: 6,
+              decoration: BoxDecoration(color: color, shape: BoxShape.circle)),
+          const SizedBox(width: 8),
+          Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text('$market · $ticker',
+                style: TextStyle(color: color, fontSize: 12, fontWeight: FontWeight.w600)),
+            Text(name, style: const TextStyle(color: Color(0xFF8B949E), fontSize: 11)),
+          ])),
+          Text(price, style: const TextStyle(color: Color(0xFFE6EDF3), fontSize: 12)),
+        ]),
+      ),
     );
   }
 }

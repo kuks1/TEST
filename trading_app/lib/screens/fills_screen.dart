@@ -15,13 +15,23 @@ class _FillsScreenState extends State<FillsScreen> {
   bool _loading = false;
   String? _error;
   String _market = 'KR';
-  String _viewMode = 'filled'; // 'filled' | 'pending'
+  String _viewMode = 'pending'; // 'filled' | 'pending'
   List<_Fill> _orders = [];
   Map<String, _StratRef> _tickerToStrategy = {};
   Map<String, double> _holdingAvg = {};
 
+  final _filledHScroll = ScrollController();
+  final _pendingHScroll = ScrollController();
+
   late DateTime _startDate;
   late DateTime _endDate;
+
+  @override
+  void dispose() {
+    _filledHScroll.dispose();
+    _pendingHScroll.dispose();
+    super.dispose();
+  }
 
   @override
   void initState() {
@@ -276,23 +286,29 @@ class _FillsScreenState extends State<FillsScreen> {
       ]),
     );
 
-    return SingleChildScrollView(
-      scrollDirection: Axis.horizontal,
-      child: SizedBox(
-        width: totalWidth,
-        child: ListView.builder(
-          itemCount: filled.length + 1,
-          itemBuilder: (_, i) {
-            if (i == 0) return headerRow;
-            final o = filled[i - 1];
-            return _FillRow(
-              order: o,
-              stratRef: _tickerToStrategy[o.ticker.toUpperCase()],
-              holdingAvg: _holdingAvg[o.ticker.toUpperCase()],
-              colWidths: colWidths,
-              market: _market,
-            );
-          },
+    return Scrollbar(
+      controller: _filledHScroll,
+      thumbVisibility: true,
+      scrollbarOrientation: ScrollbarOrientation.bottom,
+      child: SingleChildScrollView(
+        controller: _filledHScroll,
+        scrollDirection: Axis.horizontal,
+        child: SizedBox(
+          width: totalWidth,
+          child: ListView.builder(
+            itemCount: filled.length + 1,
+            itemBuilder: (_, i) {
+              if (i == 0) return headerRow;
+              final o = filled[i - 1];
+              return _FillRow(
+                order: o,
+                stratRef: _tickerToStrategy[o.ticker.toUpperCase()],
+                holdingAvg: _holdingAvg[o.ticker.toUpperCase()],
+                colWidths: colWidths,
+                market: _market,
+              );
+            },
+          ),
         ),
       ),
     );
@@ -334,24 +350,30 @@ class _FillsScreenState extends State<FillsScreen> {
       ]),
     );
 
-    return SingleChildScrollView(
-      scrollDirection: Axis.horizontal,
-      child: SizedBox(
-        width: totalWidth,
-        child: ListView.builder(
-          itemCount: pending.length + 1,
-          itemBuilder: (_, i) {
-            if (i == 0) return headerRow;
-            final o = pending[i - 1];
-            return _PendingRow(
-              key: ValueKey(o.orderId),
-              order: o,
-              stratRef: _tickerToStrategy[o.ticker.toUpperCase()],
-              colWidths: colWidths,
-              market: _market,
-              onRefresh: _loadOrders,
-            );
-          },
+    return Scrollbar(
+      controller: _pendingHScroll,
+      thumbVisibility: true,
+      scrollbarOrientation: ScrollbarOrientation.bottom,
+      child: SingleChildScrollView(
+        controller: _pendingHScroll,
+        scrollDirection: Axis.horizontal,
+        child: SizedBox(
+          width: totalWidth,
+          child: ListView.builder(
+            itemCount: pending.length + 1,
+            itemBuilder: (_, i) {
+              if (i == 0) return headerRow;
+              final o = pending[i - 1];
+              return _PendingRow(
+                key: ValueKey(o.orderId),
+                order: o,
+                stratRef: _tickerToStrategy[o.ticker.toUpperCase()],
+                colWidths: colWidths,
+                market: _market,
+                onRefresh: _loadOrders,
+              );
+            },
+          ),
         ),
       ),
     );

@@ -28,9 +28,13 @@ class Strategy {
   final int? vrG;             // G값 override (null → 자동)
   final int? vrQtyPerStep;    // 호가당 수량 (null → 1)
   final int? cyclePeriod;     // 사이클 주기 주 수 (null → 4주)
+  final int? vrRefDow;        // V값 기록 기준 요일 (1=월 ~ 7=일, null → 미설정)
   final double? v1SalsaTpPct; // 살자법 장중 익절 % (null → 5.0)
   final double? v1SalsaSlPct; // 살자법 장중 손절 % (null → 10.0)
   final String? deletedAt;    // soft delete timestamp
+  final double? endCapital;   // evaluation at deletion time
+  final bool serverSynced;    // true = 서버에서 받은 전략 (삭제 추적용)
+  final int? sortOrder;       // 홈탭 표시 순서 (낮을수록 위)
 
   const Strategy({
     this.id,
@@ -61,6 +65,10 @@ class Strategy {
     this.v1SalsaSlPct,
     this.cyclePeriod,
     this.deletedAt,
+    this.vrRefDow,
+    this.endCapital,
+    this.serverSynced = false,
+    this.sortOrder,
   });
 
   double get vrEffectiveBand => vrBand ?? 0.15;
@@ -96,6 +104,10 @@ class Strategy {
         v1SalsaSlPct: m['v1_salsa_sl_pct'] != null ? (m['v1_salsa_sl_pct'] as num).toDouble() : null,
         cyclePeriod: m['cycle_period'] as int?,
         deletedAt: m['deleted_at'] as String?,
+        vrRefDow: m['vr_ref_dow'] as int?,
+        endCapital: m['end_capital'] != null ? (m['end_capital'] as num).toDouble() : null,
+        serverSynced: (m['server_synced'] as int? ?? 0) == 1,
+        sortOrder: m['sort_order'] as int?,
       );
 
   Map<String, dynamic> toMap() => {
@@ -126,6 +138,10 @@ class Strategy {
         'v1_salsa_tp_pct': v1SalsaTpPct,
         'v1_salsa_sl_pct': v1SalsaSlPct,
         'cycle_period': cyclePeriod,
+        'vr_ref_dow': vrRefDow,
+        'end_capital': endCapital,
+        'server_synced': serverSynced ? 1 : 0,
+        if (sortOrder != null) 'sort_order': sortOrder,
       };
 
   static const _keep = Object();
@@ -156,6 +172,8 @@ class Strategy {
     Object? v1SalsaTpPct = _keep,
     Object? v1SalsaSlPct = _keep,
     Object? cyclePeriod = _keep,
+    Object? vrRefDow = _keep,
+    Object? endCapital = _keep,
   }) =>
       Strategy(
         id: id,
@@ -185,6 +203,8 @@ class Strategy {
         v1SalsaTpPct: identical(v1SalsaTpPct, _keep) ? this.v1SalsaTpPct : v1SalsaTpPct as double?,
         v1SalsaSlPct: identical(v1SalsaSlPct, _keep) ? this.v1SalsaSlPct : v1SalsaSlPct as double?,
         cyclePeriod: identical(cyclePeriod, _keep) ? this.cyclePeriod : cyclePeriod as int?,
+        vrRefDow: identical(vrRefDow, _keep) ? this.vrRefDow : vrRefDow as int?,
+        endCapital: identical(endCapital, _keep) ? this.endCapital : endCapital as double?,
       );
 
   String get typeLabel {

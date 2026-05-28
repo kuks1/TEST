@@ -1,6 +1,6 @@
-import 'dart:async';
 import 'package:flutter/material.dart';
 import '../../core/api_service.dart';
+import '../../core/app_theme.dart';
 import '../../core/common.dart';
 import '../../core/database.dart';
 import '../../models/strategy.dart';
@@ -17,10 +17,8 @@ class _KrValueDetailScreenState extends State<KrValueDetailScreen> {
   late Strategy _strategy;
   List<Map<String, dynamic>> _stocks = [];
   Map<String, double> _prices = {};
+  Map<String, Map<String, dynamic>> _holdings = {};
   bool _loading = false;
-  bool _executing = false;
-  Timer? _pollTimer;
-  String? _lastExecTime;
   final _addCtrl = TextEditingController();
   final _capitalEditCtrl = TextEditingController();
   double? _pendingCapital;
@@ -67,7 +65,6 @@ class _KrValueDetailScreenState extends State<KrValueDetailScreen> {
   void dispose() {
     _addCtrl.dispose();
     _capitalEditCtrl.dispose();
-    _pollTimer?.cancel();
     super.dispose();
   }
 
@@ -85,12 +82,18 @@ class _KrValueDetailScreenState extends State<KrValueDetailScreen> {
     if (_stocks.isEmpty) return;
     try {
       final prices = <String, double>{};
+      final holdings = <String, Map<String, dynamic>>{};
       final accountData = await ApiService.getAccount();
       final marketKey = s.market == 'KR' ? 'kr' : 'us';
       for (final acc in (accountData[marketKey] as List? ?? [])) {
         for (final h in (acc['holdings'] as List? ?? [])) {
+          final ticker = h['ticker'] as String;
           final price = (h['current_price'] as num? ?? 0).toDouble();
-          if (price > 0) prices[h['ticker'] as String] = price;
+          if (price > 0) prices[ticker] = price;
+          holdings[ticker] = {
+            'avg_price': (h['avg_price'] as num? ?? 0).toDouble(),
+            'shares': (h['shares'] as num? ?? 0).toDouble(),
+          };
         }
       }
       for (final stock in _stocks) {
@@ -103,7 +106,7 @@ class _KrValueDetailScreenState extends State<KrValueDetailScreen> {
           } catch (_) {}
         }
       }
-      if (mounted) setState(() { _prices = prices; });
+      if (mounted) setState(() { _prices = prices; _holdings = holdings; });
     } catch (_) {}
   }
 
@@ -259,136 +262,18 @@ class _KrValueDetailScreenState extends State<KrValueDetailScreen> {
 
   Future<void> _saveCapital() async {
     if (_pendingCapital == null) return;
-    final oldCapital = s.capital;
     final newCapital = _pendingCapital!;
-    final stratType = s.type;
-    final stratId = s.strategyId;
     final updated = s.copyWith(capital: newCapital);
     await AppDatabase.updateStrategy(updated);
     _capitalEditCtrl.text = _capStr(updated.capital);
     setState(() { _strategy = updated; _pendingCapital = null; });
     if (!mounted) return;
-
-    if (stratType == 'kr_value') {
-      final doRebalance = await showDialog<bool>(
-        context: context,
-        builder: (_) => AlertDialog(
-          backgroundColor: const Color(0xFF161B22),
-          title: const Text('QT 재계산'),
-          content: const Text('할당금액이 변경되었습니다. 즉시 재밸런싱을 실행할까요?'),
-          actions: [
-            TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('나중에')),
-            TextButton(
-              onPressed: () => Navigator.pop(context, true),
-              style: TextButton.styleFrom(foregroundColor: const Color(0xFF1F6FEB)),
-              child: const Text('지금 실행'),
-            ),
-          ],
-        ),
-      );
-      if (doRebalance == true && mounted) {
-        setState(() { _executing = true; _lastExecTime = Fmt.datetime(DateTime.now()); });
-        try {
-          await ApiService.rebalance(stratId);
-          _startPolling();
-        } catch (e) {
-          setState(() { _executing = false; });
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(content: Text('실행 실패: ${e.toString().replaceFirst('Exception: ', '')}'), backgroundColor: const Color(0xFFF85149)),
-            );
-          }
-        }
-      }
-    } else {
-      // VR
-      final diff = newCapital - oldCapital;
-      final msg = diff > 0 ? '풀 비중이 증가됩니다 (+${_fmtMoney(diff)})' : '풀 비중이 감소됩니다 (${_fmtMoney(diff)})';
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(msg), duration: const Duration(seconds: 2)),
-      );
-    }
-  }
-
-  Future<void> _saveAndExecute() async {
-    final sum = _weightSum;
-    if ((sum - 100).abs() > 0.1) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-            content: Text(
-                '비중 합계가 ${sum.toStringAsFixed(1)}%입니다. 100%로 맞춰주세요.'),
-            backgroundColor: const Color(0xFFF85149)),
-      );
-      return;
-    }
-
-    // 1. 제외 종목 감지
-    setState(() { _loading = true; });
-    final (removedHeld, _) = await _detectRemovedHoldings();
-    setState(() { _loading = false; });
-
-    // 2. 제외 종목 처리 선택 (매도 or 보유이동)
-    Set<String> sellTickers = {};
-    if (removedHeld.isNotEmpty && mounted) {
-      final result = await _showRemovedStocksSheet(removedHeld);
-      if (result == null || !mounted) return;
-      sellTickers = result;
-    }
-
-    // 3. DB 정리: 제외 종목 삭제 후 현재 종목 저장
-    final prevStocks =
-        await AppDatabase.getPortfolioStocks(s.strategyId);
-    final currentTickers =
-        _stocks.map((st) => st['ticker'] as String).toSet();
-    for (final prev in prevStocks) {
-      if (!currentTickers.contains(prev['ticker'] as String)) {
-        await AppDatabase.deletePortfolioStock(
-            s.strategyId, prev['ticker'] as String);
-      }
-    }
-    for (final stock in _stocks) {
-      await AppDatabase.savePortfolioStock(
-        s.strategyId,
-        stock['ticker'],
-        stock['name'] ?? '',
-        (stock['weight'] as num).toDouble(),
-      );
-    }
-
-    if (!mounted) return;
-
-    // 4. 매도 선택된 제외 종목 → weight=0 으로 추가 (전량 매도 유도)
-    final sellRemovedStocks = removedHeld
-        .where((rh) => sellTickers.contains(rh['ticker'] as String))
-        .map((rh) => <String, dynamic>{
-              'ticker': rh['ticker'],
-              'name': rh['name'] ?? rh['ticker'],
-              'weight': 0.0,
-            })
-        .toList();
-
-    await showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (_) => _RebalanceDialog(
-        stocks: [..._stocks, ...sellRemovedStocks],
-        capital: s.capital,
-        market: s.market,
-        prices: _prices,
-        isOpen: _isOpen,
-        strategyId: s.strategyId,
-      ),
-    );
-
-    if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
-        content: Text('실행가능한 일시에 주문을 생성합니다'),
-        duration: Duration(seconds: 2),
-      ),
+      const SnackBar(content: Text('할당금액이 변경되었습니다. 계획수량이 재계산됩니다.'),
+          duration: Duration(seconds: 2)),
     );
-    Navigator.of(context).pop();
   }
+
 
   // ── 제외 종목 감지 (DB 포트폴리오 vs 현재 _stocks 비교) ───────
   Future<(List<Map<String, dynamic>>, Map<String, Map<String, dynamic>>)>
@@ -435,18 +320,6 @@ class _KrValueDetailScreenState extends State<KrValueDetailScreen> {
       builder: (_) =>
           _RemovedStocksSheet(stocks: removedHeld, fmtMoney: _fmtMoney),
     );
-  }
-
-  void _startPolling() {
-    _pollTimer?.cancel();
-    int count = 0;
-    _pollTimer = Timer.periodic(const Duration(minutes: 5), (_) {
-      count++;
-      if (count >= 6) {
-        _pollTimer?.cancel();
-        setState(() { _executing = false; });
-      }
-    });
   }
 
   void _removeStock(int index) {
@@ -534,7 +407,8 @@ class _KrValueDetailScreenState extends State<KrValueDetailScreen> {
           name: stock['name'] as String? ?? ticker,
           weight: weight,
           targetAmt: targetAmt,
-          currentPrice: currentPrice,
+          // 장 마감 시 current_price=0 반환 → 보유 종목은 avgPrice fallback
+          currentPrice: currentPrice > 0 ? currentPrice : (currentQty > 0 ? avgPrice : 0),
           avgPrice: avgPrice > 0 ? avgPrice : currentPrice,
           currentQty: currentQty,
           targetQty: targetQty,
@@ -581,7 +455,7 @@ class _KrValueDetailScreenState extends State<KrValueDetailScreen> {
               TextButton(
                 onPressed: () => Navigator.pop(context, true),
                 style: TextButton.styleFrom(
-                    foregroundColor: const Color(0xFF58A6FF)),
+                    foregroundColor: AppTheme.accent),
                 child: const Text('확인 후 진행'),
               ),
             ],
@@ -667,12 +541,12 @@ class _KrValueDetailScreenState extends State<KrValueDetailScreen> {
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
               decoration: BoxDecoration(
-                color: const Color(0xFF1F6FEB).withValues(alpha: 0.15),
+                color: AppTheme.accent.withValues(alpha: 0.15),
                 borderRadius: BorderRadius.circular(4),
-                border: Border.all(color: const Color(0xFF1F6FEB).withValues(alpha: 0.4)),
+                border: Border.all(color: AppTheme.accent.withValues(alpha: 0.4)),
               ),
               child: Text(s.vrMode!,
-                  style: const TextStyle(color: Color(0xFF58A6FF), fontSize: 10)),
+                  style: TextStyle(color: AppTheme.accent, fontSize: 10)),
             ),
           ],
         ]),
@@ -682,7 +556,7 @@ class _KrValueDetailScreenState extends State<KrValueDetailScreen> {
           keyboardType: TextInputType.numberWithOptions(decimal: !isKr),
           style: TextStyle(
             fontSize: 15, fontWeight: FontWeight.w700,
-            color: changed ? const Color(0xFF58A6FF) : Colors.white,
+            color: changed ? AppTheme.accent : Colors.white,
           ),
           decoration: InputDecoration(
             isDense: true,
@@ -690,15 +564,15 @@ class _KrValueDetailScreenState extends State<KrValueDetailScreen> {
             filled: true, fillColor: const Color(0xFF0D1117),
             border: OutlineInputBorder(
               borderRadius: BorderRadius.circular(6),
-              borderSide: BorderSide(color: changed ? const Color(0xFF58A6FF) : const Color(0xFF30363D)),
+              borderSide: BorderSide(color: changed ? AppTheme.accent : const Color(0xFF30363D)),
             ),
             enabledBorder: OutlineInputBorder(
               borderRadius: BorderRadius.circular(6),
-              borderSide: BorderSide(color: changed ? const Color(0xFF58A6FF) : const Color(0xFF30363D)),
+              borderSide: BorderSide(color: changed ? AppTheme.accent : const Color(0xFF30363D)),
             ),
             focusedBorder: OutlineInputBorder(
               borderRadius: BorderRadius.circular(6),
-              borderSide: const BorderSide(color: Color(0xFF58A6FF)),
+              borderSide: BorderSide(color: AppTheme.accent),
             ),
             suffixText: isKr ? '원' : '\$',
             suffixStyle: const TextStyle(color: Color(0xFF8B949E), fontSize: 12),
@@ -728,7 +602,7 @@ class _KrValueDetailScreenState extends State<KrValueDetailScreen> {
             const SizedBox(width: 8),
             Expanded(child: ElevatedButton(
               onPressed: _saveCapital,
-              style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF1F6FEB)),
+              style: ElevatedButton.styleFrom(backgroundColor: AppTheme.accent),
               child: const Text('저장'),
             )),
           ]),
@@ -764,25 +638,6 @@ class _KrValueDetailScreenState extends State<KrValueDetailScreen> {
       body: _loading
           ? const Center(child: CircularProgressIndicator())
           : Column(children: [
-              if (_executing)
-                Container(
-                  width: double.infinity,
-                  color: const Color(0xFF1F6FEB),
-                  padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 16),
-                  child: Row(children: [
-                    const SizedBox(width: 12, height: 12,
-                        child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white)),
-                    const SizedBox(width: 8),
-                    Text('반영중 · $_lastExecTime',
-                        style: const TextStyle(color: Colors.white, fontSize: 12)),
-                    const Spacer(),
-                    TextButton(
-                      onPressed: () { _pollTimer?.cancel(); setState(() { _executing = false; }); },
-                      child: const Text('완료', style: TextStyle(color: Colors.white, fontSize: 12)),
-                    ),
-                  ]),
-                ),
-
               Expanded(
                 child: ListView(
                   padding: const EdgeInsets.all(16),
@@ -798,24 +653,24 @@ class _KrValueDetailScreenState extends State<KrValueDetailScreen> {
                     _buildCapitalCard(),
                     const SizedBox(height: 12),
 
-                    Row(children: [
-                      const Expanded(child: Text('종목',
-                          style: TextStyle(color: Color(0xFF8B949E), fontSize: 11))),
-                      const SizedBox(width: 60,
-                          child: Text('비중%', textAlign: TextAlign.center,
-                              style: TextStyle(color: Color(0xFF8B949E), fontSize: 11))),
-                      const SizedBox(width: 36),
-                    ]),
+                    const Text('보유 종목',
+                        style: TextStyle(color: Color(0xFF8B949E), fontSize: 11)),
                     const Divider(color: Color(0xFF30363D)),
 
-                    ..._stocks.asMap().entries.map((e) => _StockRow(
-                      stock: e.value,
-                      capital: s.capital,
-                      currentPrice: _prices[e.value['ticker']] ?? 0,
-                      market: s.market,
-                      onWeightChanged: (v) => setState(() { e.value['weight'] = v; }),
-                      onDelete: () => _removeStock(e.key),
-                    )),
+                    ..._stocks.asMap().entries.map((e) {
+                      final ticker = e.value['ticker'] as String? ?? '';
+                      final h = _holdings[ticker];
+                      return _StockRow(
+                        stock: e.value,
+                        capital: s.capital,
+                        currentPrice: _prices[ticker] ?? 0,
+                        avgPrice: (h?['avg_price'] as num? ?? 0).toDouble(),
+                        heldShares: (h?['shares'] as num? ?? 0).toDouble(),
+                        market: s.market,
+                        onWeightChanged: (v) => setState(() { e.value['weight'] = v; }),
+                        onDelete: () => _removeStock(e.key),
+                      );
+                    }),
 
                     const SizedBox(height: 8),
                     Align(alignment: Alignment.centerRight,
@@ -837,7 +692,7 @@ class _KrValueDetailScreenState extends State<KrValueDetailScreen> {
                         child: OutlinedButton(
                           onPressed: _setEqualWeight,
                           style: OutlinedButton.styleFrom(
-                            foregroundColor: const Color(0xFF58A6FF),
+                            foregroundColor: AppTheme.accent,
                             side: const BorderSide(color: Color(0xFF30363D)),
                           ),
                           child: const Text('동일비중'),
@@ -852,21 +707,6 @@ class _KrValueDetailScreenState extends State<KrValueDetailScreen> {
                             side: const BorderSide(color: Color(0xFF2EA043)),
                           ),
                           child: const Text('수량 조절'),
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        flex: 2,
-                        child: ElevatedButton(
-                          onPressed: _executing ? null : _saveAndExecute,
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: const Color(0xFFB91C1C),
-                          ),
-                          child: Text(_executing
-                              ? '반영중...'
-                              : _isOpen
-                                  ? '현재가 기준매수'
-                                  : '저장 (${_nextOpen()})'),
                         ),
                       ),
                     ]),
@@ -922,85 +762,157 @@ class _Cell extends StatelessWidget {
       );
 }
 
-class _StockRow extends StatelessWidget {
+class _StockRow extends StatefulWidget {
   final Map<String, dynamic> stock;
   final double capital;
   final double currentPrice;
+  final double avgPrice;
+  final double heldShares;
   final String market;
   final ValueChanged<double> onWeightChanged;
   final VoidCallback onDelete;
 
   const _StockRow({
     required this.stock, required this.capital,
-    required this.currentPrice, required this.market,
+    required this.currentPrice, required this.avgPrice,
+    required this.heldShares, required this.market,
     required this.onWeightChanged, required this.onDelete,
   });
 
   @override
-  Widget build(BuildContext context) {
-    final weight = (stock['weight'] as num? ?? 0).toDouble();
-    final ctrl = TextEditingController(text: weight.toStringAsFixed(1));
-    final targetAmt = capital * weight / 100;
-    final affordableQty = currentPrice > 0 ? (targetAmt / currentPrice).floor() : -1;
-    final priceStr = currentPrice > 0
-        ? (market == 'KR' ? Fmt.krw(currentPrice) : Fmt.usd(currentPrice))
-        : '-';
+  State<_StockRow> createState() => _StockRowState();
+}
 
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 4),
-      child: Row(children: [
-        Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Text(stock['ticker'] ?? '',
-              style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 12)),
-          Text(stock['name'] ?? '',
-              style: const TextStyle(color: Color(0xFF8B949E), fontSize: 10),
-              overflow: TextOverflow.ellipsis),
-          Row(children: [
-            Text(priceStr,
-                style: const TextStyle(color: Color(0xFF6E7681), fontSize: 10)),
-            if (affordableQty >= 0) ...[
-              const SizedBox(width: 4),
-              const Text('·', style: TextStyle(color: Color(0xFF484F58), fontSize: 10)),
-              const SizedBox(width: 4),
-              Text('매수 가능 ${affordableQty}주',
-                  style: const TextStyle(color: Color(0xFF2EA043), fontSize: 10,
-                      fontWeight: FontWeight.w500)),
-            ],
-          ]),
-        ])),
-        SizedBox(
-          width: 60,
-          child: TextField(
-            controller: ctrl,
-            keyboardType: const TextInputType.numberWithOptions(decimal: true),
-            textAlign: TextAlign.center,
-            style: const TextStyle(fontSize: 12),
-            decoration: InputDecoration(
-              isDense: true,
-              contentPadding: const EdgeInsets.symmetric(horizontal: 6, vertical: 6),
-              filled: true, fillColor: const Color(0xFF0D1117),
-              border: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(4),
-                borderSide: const BorderSide(color: Color(0xFF30363D)),
+class _StockRowState extends State<_StockRow> {
+  late final TextEditingController _ctrl;
+
+  @override
+  void initState() {
+    super.initState();
+    final w = (widget.stock['weight'] as num? ?? 0).toDouble();
+    _ctrl = TextEditingController(text: w.toStringAsFixed(1));
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final ticker  = widget.stock['ticker'] as String? ?? '';
+    final name    = widget.stock['name']   as String? ?? ticker;
+    final weight  = (widget.stock['weight'] as num? ?? 0).toDouble();
+    final capital = widget.capital;
+    final cur     = widget.currentPrice;
+    final avg     = widget.avgPrice;
+    final held    = widget.heldShares;
+    final isKr    = widget.market == 'KR';
+
+    String fmt(double v) => isKr ? Fmt.krw(v) : Fmt.usd(v);
+
+    final targetAmt      = capital * weight / 100;
+    final usePrice       = (avg > 0 && held > 0) ? avg : cur;
+    final plannedQty     = usePrice > 0 ? (targetAmt / usePrice).floor() : -1;
+    final allocValue     = (usePrice > 0 && plannedQty >= 0) ? usePrice * plannedQty : -1.0;
+    final evalAmt        = (held > 0 && cur > 0) ? held * cur : -1.0;
+    final pnlPct         = (avg > 0 && cur > 0) ? (cur - avg) / avg * 100 : double.nan;
+    final pnlColor       = (!pnlPct.isNaN && pnlPct >= 0)
+        ? const Color(0xFF2EA043) : const Color(0xFFF85149);
+
+    return Container(
+      margin: const EdgeInsets.symmetric(vertical: 4),
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: const Color(0xFF161B22),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: const Color(0xFF30363D)),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        // Row 1: 이름(티커) | 비중% 입력 | X
+        Row(children: [
+          Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(name,
+                style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 12,
+                    color: Color(0xFFE6EDF3)),
+                overflow: TextOverflow.ellipsis),
+            Text(ticker,
+                style: const TextStyle(color: Color(0xFF8B949E), fontSize: 10)),
+          ])),
+          SizedBox(
+            width: 68,
+            child: TextField(
+              controller: _ctrl,
+              keyboardType: const TextInputType.numberWithOptions(decimal: true),
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontSize: 12),
+              decoration: InputDecoration(
+                isDense: true,
+                contentPadding: const EdgeInsets.symmetric(horizontal: 6, vertical: 6),
+                filled: true, fillColor: const Color(0xFF0D1117),
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(4),
+                    borderSide: const BorderSide(color: Color(0xFF30363D))),
+                enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(4),
+                    borderSide: const BorderSide(color: Color(0xFF30363D))),
+                suffixText: '%',
+                suffixStyle: const TextStyle(fontSize: 10, color: Color(0xFF8B949E)),
               ),
-              enabledBorder: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(4),
-                borderSide: const BorderSide(color: Color(0xFF30363D)),
-              ),
-              suffixText: '%',
-              suffixStyle: const TextStyle(fontSize: 10, color: Color(0xFF8B949E)),
+              onChanged: (v) {
+                final d = double.tryParse(v);
+                if (d != null) widget.onWeightChanged(d);
+              },
             ),
-            onChanged: (v) => onWeightChanged(double.tryParse(v) ?? 0),
           ),
-        ),
-        const SizedBox(width: 8),
-        GestureDetector(
-          onTap: onDelete,
-          child: const Icon(Icons.close, size: 16, color: Color(0xFF8B949E)),
-        ),
+          const SizedBox(width: 6),
+          GestureDetector(
+            onTap: widget.onDelete,
+            child: const Icon(Icons.close, size: 16, color: Color(0xFF8B949E)),
+          ),
+        ]),
+        const SizedBox(height: 6),
+        const Divider(color: Color(0xFF21262D), height: 1),
+        const SizedBox(height: 6),
+        // Row 2: 매입단가 | 현재단가 | ±%
+        Row(children: [
+          _IC('매입단가', avg > 0 ? fmt(avg) : '-'),
+          _IC('현재단가', cur > 0 ? fmt(cur) : '-'),
+          _IC('±%',
+              pnlPct.isNaN ? '-' : '${pnlPct >= 0 ? '+' : ''}${pnlPct.toStringAsFixed(2)}%',
+              color: pnlPct.isNaN ? null : pnlColor),
+        ]),
+        const SizedBox(height: 4),
+        // Row 3: 계획수량 | 보유수량
+        Row(children: [
+          _IC('계획수량', plannedQty >= 0 ? '${plannedQty}주' : '-'),
+          _IC('보유수량', held > 0 ? '${held.toInt()}주' : '0주'),
+          const Expanded(child: SizedBox()),
+        ]),
+        const SizedBox(height: 4),
+        // Row 4: 종목할당금액 | 평가금액 | 할당금액
+        Row(children: [
+          _IC('종목할당금액', allocValue >= 0 ? fmt(allocValue) : '-'),
+          _IC('평가금액',   evalAmt   >= 0 ? fmt(evalAmt)   : '-'),
+          _IC('할당금액',   fmt(targetAmt)),
+        ]),
       ]),
     );
   }
+}
+
+class _IC extends StatelessWidget {
+  final String label, value;
+  final Color? color;
+  const _IC(this.label, this.value, {this.color});
+  @override
+  Widget build(BuildContext context) => Expanded(child: Column(
+    crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Text(label, style: const TextStyle(color: Color(0xFF6E7681), fontSize: 9)),
+      Text(value,  style: TextStyle(
+          color: color ?? const Color(0xFFE6EDF3),
+          fontSize: 11, fontWeight: FontWeight.w600)),
+    ],
+  ));
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -1234,7 +1146,7 @@ class _AdjustOrderSheetState extends State<_AdjustOrderSheet> {
             child: ElevatedButton(
               onPressed: (_executingAll || actionable == 0) ? null : _placeAll,
               style: ElevatedButton.styleFrom(
-                backgroundColor: const Color(0xFF1F6FEB),
+                backgroundColor: AppTheme.accent,
                 padding: const EdgeInsets.symmetric(vertical: 14),
               ),
               child: _executingAll
@@ -1246,291 +1158,6 @@ class _AdjustOrderSheetState extends State<_AdjustOrderSheet> {
           ),
         ),
       ]),
-    );
-  }
-}
-
-// ══════════════════════════════════════════════════════════════════
-// 매수 주문 로딩 다이얼로그
-// ══════════════════════════════════════════════════════════════════
-class _RebalanceDialog extends StatefulWidget {
-  final List<Map<String, dynamic>> stocks;
-  final double capital;
-  final String market;
-  final Map<String, double> prices;
-  final bool isOpen;
-  final String strategyId;
-
-  const _RebalanceDialog({
-    required this.stocks,
-    required this.capital,
-    required this.market,
-    required this.prices,
-    required this.isOpen,
-    required this.strategyId,
-  });
-
-  @override
-  State<_RebalanceDialog> createState() => _RebalanceDialogState();
-}
-
-class _RebalanceDialogState extends State<_RebalanceDialog> {
-  List<_AdjustOrder> _orders = [];
-  final Map<String, String> _status = {};
-  bool _done = false;
-  bool _computing = true;
-
-  @override
-  void initState() {
-    super.initState();
-    _run();
-  }
-
-  Future<void> _run() async {
-    final now = DateTime.now();
-    final createdAt = now.toIso8601String();
-
-    // 1. 현재 보유 수량 조회
-    final holdingsMap = <String, Map<String, dynamic>>{};
-    try {
-      final accountData = await ApiService.getAccount();
-      final marketKey = widget.market == 'KR' ? 'kr' : 'us';
-      for (final acc in (accountData[marketKey] as List? ?? [])) {
-        for (final h in (acc['holdings'] as List? ?? [])) {
-          holdingsMap[h['ticker'] as String] = Map<String, dynamic>.from(h);
-        }
-      }
-    } catch (_) {}
-
-    // 2. 매수/매도 주문 계산 (비중 기준 목표수량 vs 현재수량)
-    final allOrders = <_AdjustOrder>[];
-    for (final stock in widget.stocks) {
-      final ticker = stock['ticker'] as String;
-      final name = stock['name'] as String? ?? ticker;
-      final weight = (stock['weight'] as num? ?? 0).toDouble();
-      final alloc = widget.capital * weight / 100;
-
-      final holding = holdingsMap[ticker];
-      final currentQty = holding != null ? (holding['shares'] as num? ?? 0).toInt() : 0;
-      final avgPrice = holding != null ? (holding['avg_price'] as num? ?? 0).toDouble() : 0.0;
-      final currentPrice = widget.prices[ticker] ??
-          (holding != null ? (holding['current_price'] as num? ?? 0).toDouble() : 0.0);
-
-      // 기존 보유: 평단가 기준, 신규: 현재가 기준
-      final usePrice = (avgPrice > 0 && currentQty > 0) ? avgPrice : currentPrice;
-      final targetQty = usePrice > 0 ? (alloc / usePrice).floor() : 0;
-
-      allOrders.add(_AdjustOrder(
-        ticker: ticker,
-        name: name,
-        weight: weight,
-        targetAmt: alloc,
-        currentPrice: currentPrice,
-        avgPrice: avgPrice > 0 ? avgPrice : currentPrice,
-        currentQty: currentQty,
-        targetQty: targetQty,
-      ));
-    }
-
-    final actionOrders = allOrders.where((o) => !o.isOk).toList();
-    if (mounted) {
-      setState(() {
-        _orders = actionOrders;
-        _computing = false;
-        for (final o in actionOrders) { _status[o.ticker] = 'pending'; }
-      });
-    }
-
-    // 3. 이전 기간 수익률 계산 (현재 포트폴리오 시가 vs 이전 세션 자본)
-    double? pnlPct;
-    try {
-      double currentPortfolioValue = 0;
-      for (final stock in widget.stocks) {
-        final ticker = stock['ticker'] as String;
-        final holding = holdingsMap[ticker];
-        if (holding != null) {
-          final shares = (holding['shares'] as num? ?? 0).toDouble();
-          final price = widget.prices[ticker] ??
-              (holding['current_price'] as num? ?? 0).toDouble();
-          currentPortfolioValue += shares * price;
-        }
-      }
-      final prevSession =
-          await AppDatabase.getLatestQtSession(widget.strategyId);
-      if (prevSession != null && currentPortfolioValue > 0) {
-        final prevCapital =
-            (prevSession['total_capital'] as num? ?? 0).toDouble();
-        if (prevCapital > 0) {
-          pnlPct =
-              (currentPortfolioValue - prevCapital) / prevCapital * 100;
-        }
-      }
-    } catch (_) {}
-
-    // 4. 세션 생성
-    final sessionId = await AppDatabase.insertQtSession({
-      'strategy_id': widget.strategyId,
-      'session_type': 'rebalance',
-      'total_capital': widget.capital,
-      'market': widget.market,
-      'status': 'active',
-      'created_at': createdAt,
-      'pnl_pct': pnlPct,
-    });
-
-    if (!widget.isOpen) {
-      // 장 마감: 서버 예약 + Scheduled 저장
-      try {
-        await ApiService.rebalance(widget.strategyId);
-        for (final o in actionOrders) {
-          if (mounted) setState(() { _status[o.ticker] = 'scheduled'; });
-        }
-      } catch (_) {
-        for (final o in actionOrders) {
-          if (mounted) setState(() { _status[o.ticker] = 'error'; });
-        }
-      }
-      for (final o in actionOrders) {
-        await AppDatabase.insertQtOrderItem({
-          'session_id': sessionId,
-          'strategy_id': widget.strategyId,
-          'ticker': o.ticker,
-          'name': o.name,
-          'weight': o.weight,
-          'allocation_amount': o.targetAmt,
-          'planned_qty': o.delta.abs(),
-          'planned_price': o.isBuy ? o.currentPrice : o.avgPrice,
-          'actual_qty': 0,
-          'actual_price': 0.0,
-          'status': 'Scheduled',
-          'side': o.isBuy ? 'BUY' : 'SELL',
-          'created_at': createdAt,
-        });
-      }
-    } else {
-      // 장 중: 즉시 주문 (매도 선행, 매수 후행)
-      final sells = actionOrders.where((o) => o.isSell).toList();
-      final buys = actionOrders.where((o) => o.isBuy).toList();
-      for (final o in [...sells, ...buys]) {
-        await AppDatabase.insertQtOrderItem({
-          'session_id': sessionId,
-          'strategy_id': widget.strategyId,
-          'ticker': o.ticker,
-          'name': o.name,
-          'weight': o.weight,
-          'allocation_amount': o.targetAmt,
-          'planned_qty': o.delta.abs(),
-          'planned_price': o.isBuy ? o.currentPrice : o.avgPrice,
-          'actual_qty': 0,
-          'actual_price': 0.0,
-          'status': 'Scheduled',
-          'side': o.isBuy ? 'BUY' : 'SELL',
-          'created_at': createdAt,
-        });
-        try {
-          await ApiService.placeOrder(
-            market: widget.market,
-            ticker: o.ticker,
-            side: o.isBuy ? 'BUY' : 'SELL',
-            quantity: o.delta.abs(),
-            price: 0,
-            ordDvsn: '01',
-          );
-          if (mounted) setState(() { _status[o.ticker] = 'done'; });
-        } catch (_) {
-          if (mounted) setState(() { _status[o.ticker] = 'error'; });
-        }
-      }
-    }
-
-    if (mounted) setState(() { _done = true; });
-    await Future.delayed(const Duration(milliseconds: 800));
-    if (mounted && Navigator.canPop(context)) Navigator.of(context).pop();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return AlertDialog(
-      backgroundColor: const Color(0xFF161B22),
-      title: Text(
-        _computing
-            ? '보유현황 조회 중...'
-            : _done
-                ? (widget.isOpen ? '주문 완료' : '서버 등록 완료')
-                : (widget.isOpen ? '주문 생성 중...' : '서버 등록 중...'),
-        style: const TextStyle(fontSize: 15),
-      ),
-      content: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          if (!_done) const LinearProgressIndicator(
-            backgroundColor: Color(0xFF21262D),
-            valueColor: AlwaysStoppedAnimation<Color>(Color(0xFF58A6FF)),
-          ),
-          const SizedBox(height: 12),
-          if (_computing)
-            const Padding(
-              padding: EdgeInsets.symmetric(vertical: 8),
-              child: Text('보유 수량 확인 중...',
-                  style: TextStyle(color: Color(0xFF8B949E), fontSize: 11)),
-            )
-          else if (_orders.isEmpty)
-            const Text('변경 필요한 종목이 없습니다',
-                style: TextStyle(color: Color(0xFF8B949E), fontSize: 11))
-          else
-            ..._orders.map((o) {
-              final st = _status[o.ticker] ?? 'pending';
-              final isBuy = o.isBuy;
-              final color = isBuy ? const Color(0xFF2EA043) : const Color(0xFFF85149);
-              final IconData icon;
-              final Color iconColor;
-              if (st == 'done' || st == 'scheduled') {
-                icon = Icons.check_circle;
-                iconColor = const Color(0xFF2EA043);
-              } else if (st == 'error') {
-                icon = Icons.error_outline;
-                iconColor = const Color(0xFFF85149);
-              } else {
-                icon = Icons.hourglass_top;
-                iconColor = const Color(0xFF8B949E);
-              }
-              return Padding(
-                padding: const EdgeInsets.symmetric(vertical: 4),
-                child: Row(children: [
-                  st == 'pending'
-                      ? const SizedBox(
-                          width: 16, height: 16,
-                          child: CircularProgressIndicator(
-                              strokeWidth: 2, color: Color(0xFF8B949E)))
-                      : Icon(icon, size: 16, color: iconColor),
-                  const SizedBox(width: 8),
-                  Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 1),
-                    decoration: BoxDecoration(
-                      color: color.withValues(alpha: 0.12),
-                      borderRadius: BorderRadius.circular(3),
-                    ),
-                    child: Text(isBuy ? '매수' : '매도',
-                        style: TextStyle(
-                            color: color, fontSize: 8, fontWeight: FontWeight.w700)),
-                  ),
-                  const SizedBox(width: 6),
-                  Text(o.ticker,
-                      style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
-                  const SizedBox(width: 4),
-                  Expanded(child: Text(
-                    '${o.currentQty}→${o.targetQty}주',
-                    style: const TextStyle(color: Color(0xFF8B949E), fontSize: 10),
-                  )),
-                  Text(
-                    '${isBuy ? '+' : ''}${o.delta}주',
-                    style: TextStyle(color: color, fontSize: 11, fontWeight: FontWeight.w600),
-                  ),
-                ]),
-              );
-            }),
-        ],
-      ),
     );
   }
 }
@@ -1716,7 +1343,7 @@ class _RemovedStocksSheetState extends State<_RemovedStocksSheet> {
             child: ElevatedButton(
               onPressed: () => Navigator.pop(context, _sellSet),
               style: ElevatedButton.styleFrom(
-                backgroundColor: const Color(0xFF1F6FEB),
+                backgroundColor: AppTheme.accent,
                 padding: const EdgeInsets.symmetric(vertical: 14),
               ),
               child: const Text('확인',

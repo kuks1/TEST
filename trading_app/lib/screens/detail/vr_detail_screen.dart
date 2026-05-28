@@ -1,6 +1,7 @@
 import 'dart:math';
 import 'package:flutter/material.dart';
 import '../../core/api_service.dart';
+import '../../core/app_theme.dart';
 import '../../core/common.dart';
 import '../../core/database.dart';
 import '../../models/strategy.dart';
@@ -253,7 +254,7 @@ class _VrDetailScreenState extends State<VrDetailScreen> {
                   SnackBar(content: Text('G값이 ${currentG + 1}로 변경됐습니다'),
                       duration: const Duration(seconds: 2)));
               },
-              style: TextButton.styleFrom(foregroundColor: const Color(0xFF58A6FF)),
+              style: TextButton.styleFrom(foregroundColor: AppTheme.accent),
               child: Text('+1 (${currentG + 1}로 변경)'),
             ),
           ],
@@ -401,37 +402,56 @@ class _VrDetailScreenState extends State<VrDetailScreen> {
       SnackBar(content: Text(msg), backgroundColor: const Color(0xFFF85149)));
   }
 
+  Future<void> _saveRefDow(int? dow) async {
+    final updated = s.copyWith(vrRefDow: dow);
+    await AppDatabase.updateStrategy(updated);
+    setState(() { _strategy = updated; });
+  }
+
+  Future<void> _saveCyclePeriod(int weeks) async {
+    final updated = s.copyWith(cyclePeriod: weeks);
+    await AppDatabase.updateStrategy(updated);
+    setState(() { _strategy = updated; });
+  }
+
   // ─── 2주/4주 V값 자동 기록 ───────────────────────────────────
   Future<void> _checkAndRecordVValue() async {
     if (_shares <= 0 || _v1 <= 0) return;
 
     final now = DateTime.now();
+    final cycleDays = (s.cyclePeriod ?? 4) * 7;
     final lastRecord = await AppDatabase.getLastTradeLogByAction(
         s.strategyId, 'V값기록');
 
     bool shouldRecord = false;
-    String periodLabel = '';
+    String periodLabel = '${s.cyclePeriod ?? 4}주';
 
-    if (lastRecord == null) {
-      final stratAge = now.difference(s.createdAt).inDays;
-      if (stratAge >= 28) {
-        shouldRecord = true;
-        periodLabel = '4주';
-      } else if (stratAge >= 14) {
-        shouldRecord = true;
-        periodLabel = '2주';
+    final refDow = s.vrRefDow;
+
+    if (refDow != null) {
+      // 기준 요일 모드: 오늘이 기준 요일이고 마지막 기록 후 충분한 기간 경과
+      if (now.weekday != refDow) return;
+      if (lastRecord == null) {
+        final stratAge = now.difference(s.createdAt).inDays;
+        shouldRecord = stratAge >= (cycleDays - 2);
+      } else {
+        final lastDate =
+            DateTime.tryParse(lastRecord['date'] as String? ?? '') ??
+                DateTime(2000);
+        final daysSince = now.difference(lastDate).inDays;
+        shouldRecord = daysSince >= (cycleDays - 2);
       }
     } else {
-      final lastDate =
-          DateTime.tryParse(lastRecord['date'] as String? ?? '') ??
-              DateTime(2000);
-      final daysSince = now.difference(lastDate).inDays;
-      if (daysSince >= 28) {
-        shouldRecord = true;
-        periodLabel = '4주';
-      } else if (daysSince >= 14) {
-        shouldRecord = true;
-        periodLabel = '2주';
+      // 기존 방식: 경과 일수 체크
+      if (lastRecord == null) {
+        final stratAge = now.difference(s.createdAt).inDays;
+        shouldRecord = stratAge >= cycleDays;
+      } else {
+        final lastDate =
+            DateTime.tryParse(lastRecord['date'] as String? ?? '') ??
+                DateTime(2000);
+        final daysSince = now.difference(lastDate).inDays;
+        shouldRecord = daysSince >= cycleDays;
       }
     }
 
@@ -484,9 +504,6 @@ class _VrDetailScreenState extends State<VrDetailScreen> {
 
   bool get _isFirstCycle => _v1 == 0;
 
-  // 시장가 매수 수량 (첫 사이클): 할당금액 / 현재가
-  int get _marketBuyQty => _currentPrice > 0 ? (s.capital / _currentPrice).floor() : 0;
-
   double get _cashFlow {
     switch (_mode) {
       case '적립식': return s.vrEffectiveDeposit;
@@ -535,6 +552,8 @@ class _VrDetailScreenState extends State<VrDetailScreen> {
           const SizedBox(height: 10),
           _buildModeCard(),
           const SizedBox(height: 10),
+          _buildRefDowCard(),
+          const SizedBox(height: 10),
           _buildParamsCard(),
           const SizedBox(height: 10),
           _buildStatusCard(),
@@ -557,12 +576,12 @@ class _VrDetailScreenState extends State<VrDetailScreen> {
       Container(
         padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
         decoration: BoxDecoration(
-          color: const Color(0xFF1F6FEB).withValues(alpha: 0.15),
+          color: AppTheme.accent.withValues(alpha: 0.15),
           borderRadius: BorderRadius.circular(6),
-          border: Border.all(color: const Color(0xFF1F6FEB).withValues(alpha: 0.4)),
+          border: Border.all(color: AppTheme.accent.withValues(alpha: 0.4)),
         ),
         child: Text('VR · ${s.market}',
-            style: const TextStyle(color: Color(0xFF58A6FF), fontSize: 11)),
+            style: TextStyle(color: AppTheme.accent, fontSize: 11)),
       ),
     ]));
   }
@@ -577,18 +596,18 @@ class _VrDetailScreenState extends State<VrDetailScreen> {
         keyboardType: TextInputType.numberWithOptions(decimal: !_isKr),
         style: TextStyle(
           fontSize: 15, fontWeight: FontWeight.w700,
-          color: changed ? const Color(0xFF58A6FF) : Colors.white,
+          color: changed ? AppTheme.accent : Colors.white,
         ),
         decoration: InputDecoration(
           isDense: true,
           contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
           filled: true, fillColor: const Color(0xFF0D1117),
           border: OutlineInputBorder(borderRadius: BorderRadius.circular(6),
-              borderSide: BorderSide(color: changed ? const Color(0xFF58A6FF) : const Color(0xFF30363D))),
+              borderSide: BorderSide(color: changed ? AppTheme.accent : const Color(0xFF30363D))),
           enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(6),
-              borderSide: BorderSide(color: changed ? const Color(0xFF58A6FF) : const Color(0xFF30363D))),
+              borderSide: BorderSide(color: changed ? AppTheme.accent : const Color(0xFF30363D))),
           focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(6),
-              borderSide: const BorderSide(color: Color(0xFF58A6FF))),
+              borderSide: BorderSide(color: AppTheme.accent)),
           suffixText: _isKr ? '원' : '\$',
           suffixStyle: const TextStyle(color: Color(0xFF8B949E), fontSize: 12),
         ),
@@ -612,7 +631,7 @@ class _VrDetailScreenState extends State<VrDetailScreen> {
           const SizedBox(width: 8),
           Expanded(child: ElevatedButton(
             onPressed: _saveCapital,
-            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF1F6FEB)),
+            style: ElevatedButton.styleFrom(backgroundColor: AppTheme.accent),
             child: const Text('저장'),
           )),
         ]),
@@ -631,12 +650,10 @@ class _VrDetailScreenState extends State<VrDetailScreen> {
             child: Container(
               padding: const EdgeInsets.symmetric(vertical: 10),
               decoration: BoxDecoration(
-                color: _mode == mode
-                    ? const Color(0xFF1F6FEB)
-                    : const Color(0xFF21262D),
+                color: _mode == mode ? AppTheme.accent : const Color(0xFF21262D),
                 borderRadius: BorderRadius.circular(6),
                 border: Border.all(
-                  color: _mode == mode ? const Color(0xFF1F6FEB) : const Color(0xFF30363D),
+                  color: _mode == mode ? AppTheme.accent : const Color(0xFF30363D),
                 ),
               ),
               child: Column(children: [
@@ -644,17 +661,112 @@ class _VrDetailScreenState extends State<VrDetailScreen> {
                   fontSize: 13, fontWeight: FontWeight.w600,
                   color: _mode == mode ? Colors.white : const Color(0xFF8B949E),
                 )),
-                Text(
-                  mode == '적립식' ? '정기 적립' : mode == '거치식' ? '거치 운용' : '정기 인출',
-                  style: TextStyle(fontSize: 10,
-                      color: _mode == mode ? Colors.white70 : const Color(0xFF57606A)),
-                ),
+                if (mode == '적립식')
+                  Text(
+                    '정기 적립',
+                    style: TextStyle(fontSize: 10,
+                        color: _mode == mode ? Colors.white70 : const Color(0xFF57606A)),
+                  ),
+                if (mode == '거치식') ...[
+                  const SizedBox(height: 2),
+                  Text('적립액 × 260배',
+                      style: TextStyle(fontSize: 9,
+                          color: _mode == mode ? Colors.white54 : const Color(0xFF484F58))),
+                ],
+                if (mode == '인출식') ...[
+                  const SizedBox(height: 2),
+                  Text('적립액 × 4,000배',
+                      style: TextStyle(fontSize: 9,
+                          color: _mode == mode ? Colors.white54 : const Color(0xFF484F58))),
+                ],
               ]),
             ),
           )),
           if (mode != '인출식') const SizedBox(width: 6),
         ],
       ]),
+    ]));
+  }
+
+  Widget _buildRefDowCard() {
+    const dowLabels = ['월', '화', '수', '목', '금'];
+    final period = s.cyclePeriod ?? 4;
+    return _Card(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      // 주기 선택 행
+      Row(children: [
+        const Text('주기', style: TextStyle(color: Color(0xFF8B949E), fontSize: 12)),
+        const SizedBox(width: 10),
+        for (final weeks in [2, 4]) ...[
+          GestureDetector(
+            onTap: () => _saveCyclePeriod(weeks),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+              decoration: BoxDecoration(
+                color: period == weeks ? AppTheme.accent : const Color(0xFF21262D),
+                borderRadius: BorderRadius.circular(6),
+                border: Border.all(
+                  color: period == weeks ? AppTheme.accent : const Color(0xFF30363D),
+                ),
+              ),
+              child: Text('$weeks주', style: TextStyle(
+                fontSize: 12, fontWeight: FontWeight.w600,
+                color: period == weeks ? Colors.white : const Color(0xFF8B949E),
+              )),
+            ),
+          ),
+          if (weeks == 2) const SizedBox(width: 6),
+        ],
+      ]),
+      const SizedBox(height: 10),
+      // 기준 요일 행
+      Row(children: [
+        Text('V값 기준 요일', style: const TextStyle(color: Color(0xFF8B949E), fontSize: 12)),
+        const Spacer(),
+        if (s.vrRefDow != null)
+          TextButton(
+            onPressed: () => _saveRefDow(null),
+            style: TextButton.styleFrom(
+              foregroundColor: const Color(0xFF8B949E),
+              padding: EdgeInsets.zero,
+              minimumSize: Size.zero,
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            ),
+            child: const Text('해제', style: TextStyle(fontSize: 11)),
+          ),
+      ]),
+      const SizedBox(height: 8),
+      Row(children: [
+        for (int i = 0; i < 5; i++) ...[
+          if (i > 0) const SizedBox(width: 6),
+          Expanded(child: GestureDetector(
+            onTap: () => _saveRefDow(i + 1),
+            child: Container(
+              padding: const EdgeInsets.symmetric(vertical: 8),
+              decoration: BoxDecoration(
+                color: s.vrRefDow == i + 1 ? AppTheme.accent : const Color(0xFF21262D),
+                borderRadius: BorderRadius.circular(6),
+                border: Border.all(
+                  color: s.vrRefDow == i + 1 ? AppTheme.accent : const Color(0xFF30363D),
+                ),
+              ),
+              child: Center(child: Text(dowLabels[i],
+                style: TextStyle(
+                  fontSize: 12, fontWeight: FontWeight.w600,
+                  color: s.vrRefDow == i + 1
+                      ? Colors.white
+                      : const Color(0xFF8B949E),
+                ),
+              )),
+            ),
+          )),
+        ],
+      ]),
+      if (s.vrRefDow == null)
+        Padding(
+          padding: const EdgeInsets.only(top: 6),
+          child: Text('미설정 시 경과 일수($period주)로 자동 판단',
+              style: const TextStyle(color: Color(0xFF6E7681), fontSize: 10)),
+        ),
     ]));
   }
 
@@ -684,14 +796,14 @@ class _VrDetailScreenState extends State<VrDetailScreen> {
             const SizedBox(width: 8),
             TextButton(
               onPressed: _saveParams,
-              style: TextButton.styleFrom(foregroundColor: const Color(0xFF58A6FF),
+              style: TextButton.styleFrom(foregroundColor: AppTheme.accent,
                   padding: EdgeInsets.zero, minimumSize: Size.zero, tapTargetSize: MaterialTapTargetSize.shrinkWrap),
               child: const Text('저장', style: TextStyle(fontSize: 12)),
             ),
           ]),
       ]),
       const SizedBox(height: 10),
-      // 행 1: 밴드 + Pool 한도
+      // 행 1: 밴드 + Pool 사용량(%)
       Row(children: [
         Expanded(child: _ParamField(
           label: '밴드',
@@ -701,10 +813,11 @@ class _VrDetailScreenState extends State<VrDetailScreen> {
         )),
         const SizedBox(width: 8),
         Expanded(child: _ParamField(
-          label: 'Pool 한도',
+          label: 'Pool 사용량(%)',
           controller: _poolPctCtrl,
           suffix: '%',
           onChanged: (_) => setState(() { _pendingParams = true; }),
+          infoMessage: '적립식 실행 이후 1년 동안은 Pool 제한이 없다.',
         )),
       ]),
       const SizedBox(height: 8),
@@ -716,6 +829,7 @@ class _VrDetailScreenState extends State<VrDetailScreen> {
           suffix: '',
           keyboardType: TextInputType.number,
           onChanged: (_) => setState(() { _pendingParams = true; }),
+          infoMessage: 'G 값은 1년에 1씩 증가한다.',
         )),
         const SizedBox(width: 8),
         Expanded(child: _ParamField(
@@ -788,8 +902,12 @@ class _VrDetailScreenState extends State<VrDetailScreen> {
   Widget _buildOrdersCard() {
     final fmt = _isKr ? Fmt.krw : Fmt.usd;
 
-    // ── 첫 사이클: 시장가 매수 ──
+    // ── 첫 사이클: 매일 시장가 매수 ──
     if (_isFirstCycle) {
+      final qty = _qtyPerStep;
+      final days = _currentPrice > 0 && qty > 0
+          ? (s.capital / (_currentPrice * qty)).floor()
+          : 0;
       return _Card(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         Row(children: [
           const Text('주문 계획', style: TextStyle(color: Color(0xFF8B949E), fontSize: 12)),
@@ -810,14 +928,16 @@ class _VrDetailScreenState extends State<VrDetailScreen> {
             border: Border.all(color: const Color(0xFFF0A500).withValues(alpha: 0.3)),
           ),
           child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            const Text('시장가 매수 (장 시작 즉시)',
+            const Text('매일 시장가 매수 (장 시작 즉시)',
                 style: TextStyle(color: Color(0xFFF0A500), fontSize: 13, fontWeight: FontWeight.w600)),
             const SizedBox(height: 6),
-            if (_currentPrice > 0) ...[
-              _Row('현재가', fmt(_currentPrice)),
-              _Row('매수 수량', '$_marketBuyQty 주  (할당금액 ÷ 현재가)'),
-              _Row('예상 금액', fmt(_marketBuyQty * _currentPrice)),
-            ] else
+            if (_currentPrice > 0 && days > 0) ...[
+              _Row('현재가 (기준)', fmt(_currentPrice)),
+              _Row('호가당 수량', '$qty 주'),
+            ] else if (_currentPrice > 0 && days <= 0)
+              const Text('할당금액이 부족합니다 (호가당 수량 × 현재가 > 할당금액)',
+                  style: TextStyle(color: Color(0xFF8B949E), fontSize: 12))
+            else
               const Text('계좌 데이터를 불러오면 수량이 표시됩니다',
                   style: TextStyle(color: Color(0xFF8B949E), fontSize: 12)),
           ]),
@@ -1018,10 +1138,32 @@ class _ParamField extends StatelessWidget {
   final TextEditingController controller;
   final ValueChanged<String> onChanged;
   final TextInputType? keyboardType;
-  const _ParamField({required this.label, required this.controller, required this.suffix, required this.onChanged, this.keyboardType});
+  final String? infoMessage;
+  const _ParamField({required this.label, required this.controller, required this.suffix, required this.onChanged, this.keyboardType, this.infoMessage});
   @override
   Widget build(BuildContext context) => Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Text(label, style: const TextStyle(color: Color(0xFF8B949E), fontSize: 11)),
+        Row(children: [
+          Text(label, style: const TextStyle(color: Color(0xFF8B949E), fontSize: 11)),
+          if (infoMessage != null) ...[
+            const SizedBox(width: 2),
+            GestureDetector(
+              onTap: () => showDialog(
+                context: context,
+                builder: (_) => AlertDialog(
+                  backgroundColor: const Color(0xFF161B22),
+                  content: Text(infoMessage!, style: const TextStyle(color: Color(0xFFE6EDF3), fontSize: 13)),
+                  actions: [
+                    TextButton(
+                      onPressed: () => Navigator.pop(context),
+                      child: const Text('확인'),
+                    ),
+                  ],
+                ),
+              ),
+              child: const Icon(Icons.info_outline, size: 13, color: Color(0xFF8B949E)),
+            ),
+          ],
+        ]),
         const SizedBox(height: 4),
         TextField(
           controller: controller,
@@ -1036,7 +1178,7 @@ class _ParamField extends StatelessWidget {
             enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(6),
                 borderSide: const BorderSide(color: Color(0xFF30363D))),
             focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(6),
-                borderSide: const BorderSide(color: Color(0xFF58A6FF))),
+                borderSide: BorderSide(color: AppTheme.accent)),
             suffixText: suffix,
             suffixStyle: const TextStyle(color: Color(0xFF8B949E), fontSize: 11),
           ),
